@@ -1,0 +1,187 @@
+# ============================================
+# 量化交易系统 .gitignore
+# 忽略数据和特征文件，只管理代码
+# ============================================
+
+# 数据文件
+# ============================================
+# 股票原始数据目录（实际存在的）
+data/data/
+data/data/sp500/
+data/data/sp500_1min/
+data/data/sp500_5min/
+
+# 数据文件（所有层级）
+data/**/*.csv
+data/**/*.parquet
+data/**/*.h5
+data/**/*.hdf5
+data/**/*.pickle
+data/**/*.pkl
+
+# 具体的数据文件
+data/instrument_sector.csv
+data/instrument_shares.csv
+data/sp500_list.csv
+
+# Qlib 数据库文件
+qlib_data/
+*.bin
+instruments/
+calendars/
+features/
+
+# 特征文件
+# ============================================
+# 特征存储目录
+artifacts/
+features/
+features_*.parquet
+features_*.csv
+features_*.h5
+
+# 模型相关文件
+# ============================================
+# 模型权重和检查点
+models/weights/
+models/checkpoints/
+*.model
+*.pkl
+*.joblib
+*.h5
+*.pth
+*.pt
+*.onnx
+
+# 训练输出
+logs/
+runs/
+outputs/
+results/
+experiments/
+
+# 数据库文件
+# ============================================
+*.db
+*.sqlite
+*.sqlite3
+
+# 配置中的敏感信息
+# ============================================
+config/secrets.yaml
+config/api_keys.yaml
+.env
+.env.local
+.env.*.local
+
+# 系统和IDE文件
+# ============================================
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+# 临时文件
+# ============================================
+*.tmp
+*.temp
+*.log
+*.out
+*.err
+
+# 缓存目录
+cache/
+.cache/
+tmp/
+temp/
+
+# 备份文件
+*.bak
+*.backup
+*.old
+
+# 压缩文件（通常包含数据）
+# ============================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# 大文件和二进制文件
+# ============================================
+*.bin
+*.dat
+*.dump
+
+# 特定于项目的忽略
+# ============================================
+# 如果有股本数据文件
+shares_data.csv
+sector_mapping.csv
+
+# 如果有API密钥或配置
+api_config.json
+trading_config.yaml
+
+# 性能分析文件
+*.prof
+*.profile
+
+# 测试覆盖率报告
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
