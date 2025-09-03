@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run_backtest.py  (v3.3.1 with diagnostics)
+run_backtest.py  (v3.4 · diagnostics + execution-costs + short-leg filters)
 
-在 v3.3 基础上新增：
-- 每日 turnover（pre-ADV / post-ADV），%ADV 限速命中率（裁剪票数与裁剪权重占比）
-- 多/空腿日度贡献（ret_long, ret_short），平均敞口、长短腿 Sharpe、总佣金
-- 导出 per_day_ext.csv 与 kpis.json
+在 v3.3.1 基础上新增/改进：
+- **短腿筛选**： --short_score_q / --short_liq_min_bucket
+- **费用模型（更贴近实盘）**：
+  * per-share 佣金/交易所费
+  * SEC Section 31 卖出费用（按 $/百万）
+  * 集合竞价额外价差开销（trade_at=open/close 时可单独配置）
+  * 借券年化费（每日按空头名义额计提）
+- **诊断增强**：
+  * 每日：pre/post-turnover、%ADV 限速命中率、长/短腿收益拆分
+  * 费用归集：累计佣金(含交易所/SEC/竞价价差)、累计借券费
+  * 导出 per_day_ext.csv / orders.csv / positions.csv / summary.json / kpis.json
 
 保持兼容：
-- exec_lag / target_vol / %ADV 限速 / 权重方案 equal|icdf / 中性化 / 平滑 等均保留
+- exec_lag / target_vol / %ADV 限速 / 权重 equal|icdf / 中性化 / 平滑 / 诊断输出
 """
 
 from __future__ import annotations
@@ -254,6 +261,34 @@ def icdf_weights(ranks: np.ndarray) -> np.ndarray:
     return z
 
 
+# ----------------------------- Commission / Fees -----------------------------
+class HybridCommission(bt.CommInfoBase):
+    """
+    组合佣金/费用模型：
+      - commission_bps        : 按成交额计提（bps）
+      - per_share_commission  : 每股佣金（USD/股）
+      - per_share_exchange    : 每股交易所费（USD/股）
+      - sec_fee_per_million   : 卖出端的 SEC Section31 费用（USD / 1,000,000 成交额）
+    """
+    params = dict(
+        commission_bps=1.0,
+        per_share_commission=0.0,
+        per_share_exchange=0.0,
+        sec_fee_per_million=8.0,  # 仅对卖出适用
+    )
+    def getcommission(self, size, price, pseudoexec=False):
+        size = float(size)
+        price = float(price)
+        value = abs(size) * price
+        shares = abs(size)
+        comm_val = value * (self.p.commission_bps / 10000.0)
+        comm_val += shares * (self.p.per_share_commission + self.p.per_share_exchange)
+        # SEC fee 只对卖出（size<0）计提
+        if size < 0:
+            comm_val += (value / 1_000_000.0) * self.p.sec_fee_per_million
+        return float(comm_val)
+
+
 # ----------------------------- Strategy -----------------------------
 class XSecRebalance(bt.Strategy):
     params = dict(
@@ -271,12 +306,23 @@ class XSecRebalance(bt.Strategy):
         max_pos_per_name=0.05,
         weight_scheme="equal",
 
+        # 进入/退出缓冲 + 平滑
         membership_buffer=0.2,
         smooth_eta=0.6,
 
+        # 目标波动 / 杠杆 / %ADV
         target_vol=0.0,
         leverage_cap=2.0,
         adv_limit_pct=0.0,
+
+        # 短腿筛选
+        short_score_q=1.0,          # 仅做空 score 分位 < q
+        short_liq_min_bucket=-1,    # 仅做空 流动性桶 >= 此阈值
+
+        # 费用扩展
+        auction_spread_bps_open=0.0,
+        auction_spread_bps_close=0.0,
+        borrow_bps_ann=0.0,
 
         verbose=False,
     )
@@ -300,8 +346,10 @@ class XSecRebalance(bt.Strategy):
         self.reb_counter = 0
 
         # 诊断记录
-        self.diag_daily = []   # 每日：ret, ret_long, ret_short, turnover_pre/post, adv_clip_ratio 等
+        self.diag_daily = []
         self._commission_cum = 0.0
+        self._borrow_cum = 0.0
+        self._auction_charged = set()  # {(date, symbol)} 防止一日多次重复计提竞价价差
 
         if str(self.p.trade_at).lower() == "close":
             self.broker.set_coc(True)
@@ -310,16 +358,40 @@ class XSecRebalance(bt.Strategy):
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
             return
+
+        dt = pd.Timestamp(bt.num2date(order.executed.dt or self.datas[0].datetime[0]).date())
+        sym = order.data._name if order.data else None
+        exec_value = float(abs(order.executed.value or 0.0))
+        exec_comm  = float(order.executed.comm or 0.0)
+
+        # 集合竞价额外成本（首笔/当日/当票）
+        auction_bps = 0.0
+        if (sym is not None) and (dt in self._exec):
+            if (dt, sym) not in self._auction_charged:
+                if str(self.p.trade_at).lower() == "open":
+                    auction_bps = float(self.p.auction_spread_bps_open or 0.0)
+                elif str(self.p.trade_at).lower() == "close":
+                    auction_bps = float(self.p.auction_spread_bps_close or 0.0)
+                if auction_bps > 0 and exec_value > 0:
+                    extra = exec_value * (auction_bps / 10000.0)
+                    try:
+                        self.broker.add_cash(-extra)
+                    except Exception:
+                        pass
+                    exec_comm += extra
+                    self._auction_charged.add((dt, sym))
+
+        self._commission_cum += exec_comm
+
         rec = {
-            "datetime": pd.Timestamp(bt.num2date(order.executed.dt or self.datas[0].datetime[0]).date()),
-            "instrument": order.data._name if order.data else None,
+            "datetime": dt,
+            "instrument": sym,
             "status": order.getstatusname(),
             "size": float(order.size),
             "price": float(order.executed.price or np.nan),
             "value": float(order.executed.value or np.nan),
-            "commission": float(order.executed.comm or np.nan),
+            "commission": float(exec_comm),
         }
-        self._commission_cum += float(order.executed.comm or 0.0)
         self.order_records.append(rec)
         if self.p.verbose:
             print("[order]", rec)
@@ -358,7 +430,7 @@ class XSecRebalance(bt.Strategy):
             longs_keep = {ins for ins, w in self.prev_weights.items() if w > 0}
             longs_ok = set(g[g["rank"] <= exit_long_thr]["instrument"])
             longs = list((longs_enter | (longs_keep & longs_ok)) if top_k > 0 else set())
-            # shorts
+            # shorts（先按 rank 尾部，再去应用短腿筛选）
             g_tail = g.iloc[::-1].copy()
             enter_short_thr = short_k
             exit_short_thr  = int(np.ceil(short_k * (1.0 + buf)))
@@ -381,9 +453,22 @@ class XSecRebalance(bt.Strategy):
             shorts_keep = {ins for ins, w in self.prev_weights.items() if w < 0}
             shorts = list((shorts_enter | (shorts_keep & shorts_exit_zone)) if short_k > 0 else set())
 
-        if self.reb_counter < 10 and self.p.verbose:
-            print(f"[rebalance {self.reb_counter}] longs={len(longs)} shorts={len(shorts)} (candidates={len(g)})")
         return longs, shorts, g
+
+    def _liq_bucket_map(self, dt: pd.Timestamp) -> dict[str, int]:
+        expos = self._expos.get(dt)
+        if expos is None or expos.empty:
+            return {}
+        liq_cols = [c for c in expos.columns if c.startswith("liq_bucket_")]
+        if not liq_cols:
+            return {}
+        sub = expos[["instrument"] + liq_cols].copy()
+        # one-hot → 桶号（若全0/缺失则 -1）
+        arr = sub[liq_cols].to_numpy(dtype=float)
+        idx = arr.argmax(axis=1)
+        has1 = (arr.max(axis=1) > 0.5)
+        buckets = np.where(has1, idx, -1)
+        return dict(zip(sub["instrument"], buckets))
 
     # ----- Core -----
     def next(self):
@@ -395,23 +480,38 @@ class XSecRebalance(bt.Strategy):
         self.val_records.append({"datetime": dtoday, "value": port_val, "cash": port_cash})
 
         # ---------- 日度收益拆腿（使用昨日权重 * 今日 C2C 收益） ----------
-        # 注意：这里的 ret 是 close/prev_close - 1，与 trade_at 无关（统一度量组合表现）
         w_prev = pd.Series(self.prev_weights, dtype=float)
         ret_map = {}
         for d in self.datas:
-            if len(d) < 2:  # 需要至少两根K
+            if len(d) < 2:
                 continue
-            prev_c = float(d.close[-1])
-            curr_c = float(d.close[0])
+            prev_c = float(d.close[-1]); curr_c = float(d.close[0])
             if prev_c > 0:
                 ret_map[d._name] = (curr_c / prev_c - 1.0)
         if len(w_prev) > 0 and ret_map:
             rets = pd.Series(ret_map).reindex(w_prev.index).fillna(0.0)
             total_ret = float((w_prev * rets).sum())
             long_ret  = float((w_prev.clip(lower=0.0) * rets).sum())
-            short_ret = float((w_prev.clip(upper=0.0) * rets).sum())  # 负数代表短腿贡献为负
+            short_ret = float((w_prev.clip(upper=0.0) * rets).sum())
         else:
             total_ret, long_ret, short_ret = 0.0, 0.0, 0.0
+
+        # 借券费（日度）：按当日开盘前持有的空头名义额计提
+        borrow_cost = 0.0
+        borrow_bps = float(self.p.borrow_bps_ann or 0.0)
+        if borrow_bps > 0:
+            short_val = 0.0
+            for d in self.datas:
+                pos = self.getposition(d)
+                if pos.size < 0:
+                    short_val += float(-pos.size * d.close[0])
+            if short_val > 0:
+                borrow_cost = short_val * (borrow_bps / 10000.0) / 252.0
+                try:
+                    self.broker.add_cash(-borrow_cost)
+                except Exception:
+                    pass
+                self._borrow_cum += borrow_cost
 
         # 记录持仓快照
         for d in self.datas:
@@ -421,7 +521,7 @@ class XSecRebalance(bt.Strategy):
                                          "size": float(pos.size), "price": float(pos.price),
                                          "value": float(pos.size * d.close[0])})
 
-        # ---------- 若不是执行日，记诊断后返回 ----------
+        # 若不是执行日，仅记录诊断
         if dtoday not in self._exec:
             self.diag_daily.append({
                 "datetime": dtoday,
@@ -435,10 +535,11 @@ class XSecRebalance(bt.Strategy):
                 "gross_long": float(w_prev.clip(lower=0.0).sum()),
                 "gross_short": float(-w_prev.clip(upper=0.0).sum()),
                 "commission_cum": float(self._commission_cum),
+                "borrow_cost": float(borrow_cost),
             })
             return
 
-        # ---------- 选股 ----------
+        # ---------- 选股（含短腿二次筛选） ----------
         g = self._preds.get(dtoday)
         if g is None or g.empty:
             if self.p.verbose:
@@ -450,10 +551,26 @@ class XSecRebalance(bt.Strategy):
                 "gross_long": float(w_prev.clip(lower=0.0).sum()),
                 "gross_short": float(-w_prev.clip(upper=0.0).sum()),
                 "commission_cum": float(self._commission_cum),
+                "borrow_cost": float(borrow_cost),
             })
             return
 
         longs, shorts, g_sorted = self._members_with_buffer(g)
+
+        # ----- 短腿二次筛选：score 分位 + 流动性桶阈值 -----
+        # 1) score 分位（保留 score <= q_th 的票；因为短腿选最差）
+        q = float(self.p.short_score_q or 1.0)
+        if q < 1.0 and "score" in g_sorted.columns and len(shorts) > 0:
+            try:
+                q_th = g_sorted["score"].quantile(q)
+                shorts = [s for s in shorts if s in set(g_sorted[g_sorted["score"] <= q_th]["instrument"])]
+            except Exception:
+                pass
+        # 2) 流动性桶（仅保留 bucket >= min_bucket）
+        min_bucket = int(self.p.short_liq_min_bucket)
+        if min_bucket >= 0 and len(shorts) > 0:
+            liq_map = self._liq_bucket_map(dtoday)
+            shorts = [s for s in shorts if int(liq_map.get(s, -1)) >= min_bucket]
 
         # ---------- 权重生成 ----------
         tgt = {}
@@ -568,6 +685,7 @@ class XSecRebalance(bt.Strategy):
             "gross_long": float(w_prev_ser.clip(lower=0.0).sum()),
             "gross_short": float(-w_prev_ser.clip(upper=0.0).sum()),
             "commission_cum": float(self._commission_cum),
+            "borrow_cost": float(borrow_cost),
         })
 
         self.prev_weights = tgt.copy()
@@ -595,10 +713,12 @@ def parse_args():
     ap.add_argument("--short_exposure", type=float, default=-1.0)
     ap.add_argument("--max_pos_per_name", type=float, default=0.05)
     ap.add_argument("--weight_scheme", choices=["equal","icdf"], default="equal")
+
+    # 短腿筛选
     ap.add_argument("--short_score_q", type=float, default=1.0,
-                help="仅做空 score 分位 < q 的票；1.0 表示不限制")
+                    help="仅做空 score 分位 < q 的票；1.0 表示不限制")
     ap.add_argument("--short_liq_min_bucket", type=int, default=-1,
-                help="仅做空流动性桶 >= 此阈值的票；-1 表示不限制")
+                    help="仅做空流动性桶 >= 此阈值；-1 表示不限制")
 
     ap.add_argument("--membership_buffer", type=float, default=0.2)
     ap.add_argument("--smooth_eta", type=float, default=0.6)
@@ -608,8 +728,16 @@ def parse_args():
     ap.add_argument("--leverage_cap", type=float, default=2.0)
     ap.add_argument("--adv_limit_pct", type=float, default=0.0, help="单次换手 %ADV 限制，例如 0.005=0.5%%ADV")
 
+    # 费用与滑点（扩展）
     ap.add_argument("--commission_bps", type=float, default=1.0)
     ap.add_argument("--slippage_bps", type=float, default=5.0)
+    ap.add_argument("--per_share_commission", type=float, default=0.0, help="USD/股")
+    ap.add_argument("--per_share_exchange_fee", type=float, default=0.0, help="USD/股")
+    ap.add_argument("--sec_fee_per_million", type=float, default=8.0, help="USD / $1,000,000（仅卖出）")
+    ap.add_argument("--auction_spread_bps_open", type=float, default=0.0, help="开盘集合竞价额外 bps")
+    ap.add_argument("--auction_spread_bps_close", type=float, default=0.0, help="收盘集合竞价额外 bps")
+    ap.add_argument("--borrow_bps_ann", type=float, default=0.0, help="借券费年化 bps（按空头名义额计提）")
+
     ap.add_argument("--cash", type=float, default=1_000_000.0)
     ap.add_argument("--anchor_symbol", default="SPY")
     ap.add_argument("--out_dir", required=True)
@@ -655,7 +783,7 @@ def main():
     pos_map = {d: i for i, d in enumerate(anchor_list)}
     for sd in sched2pred.keys():
         i = pos_map.get(sd)
-        if i is None:  # 理论不应发生
+        if i is None:
             continue
         j = i + max(0, int(args.exec_lag))
         if j < len(anchor_list):
@@ -697,14 +825,20 @@ def main():
     # 中性化暴露、波动/ADV
     neutral_list = [s.strip().lower() for s in args.neutralize.split(",") if s.strip()]
     expos_map = build_exposures_map(args.features_path, universe=set(price_map.keys()),
-                                    dates=list(preds_by_exec.keys()), use_items=neutral_list)
+                                    dates=list(preds_by_exec.keys()), use_items=neutral_list + (["liq"] if args.short_liq_min_bucket >= 0 else []))
     vol_map, adv_map = compute_vol_adv_maps(args.features_path, universe=set(price_map.keys()),
                                             dates=list(preds_by_exec.keys()), halflife=int(args.ewm_halflife))
 
-    # Backtrader
+    # Backtrader broker：自定义佣金 + 百分比滑点
     cerebro = bt.Cerebro(stdstats=True)
     cerebro.broker.setcash(float(args.cash))
-    cerebro.broker.setcommission(commission=float(args.commission_bps) / 10000.0)
+    comminfo = HybridCommission(
+        commission_bps=float(args.commission_bps),
+        per_share_commission=float(args.per_share_commission),
+        per_share_exchange=float(args.per_share_exchange_fee),
+        sec_fee_per_million=float(args.sec_fee_per_million),
+    )
+    cerebro.broker.addcommissioninfo(comminfo)
     cerebro.broker.set_slippage_perc(perc=float(args.slippage_bps) / 10000.0,
                                      slip_open=True, slip_limit=True, slip_match=True)
     if args.trade_at == "close":
@@ -733,6 +867,11 @@ def main():
         target_vol=args.target_vol,
         leverage_cap=args.leverage_cap,
         adv_limit_pct=args.adv_limit_pct,
+        short_score_q=args.short_score_q,
+        short_liq_min_bucket=args.short_liq_min_bucket,
+        auction_spread_bps_open=args.auction_spread_bps_open,
+        auction_spread_bps_close=args.auction_spread_bps_close,
+        borrow_bps_ann=args.borrow_bps_ann,
         verbose=args.verbose,
     )
     cerebro.addanalyzer(bt.analyzers.TimeReturn, timeframe=bt.TimeFrame.Days, _name='timeret', fund=False)
@@ -747,7 +886,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     eq.to_csv(out_dir / "equity_curve.csv", index=False)
 
-    # 导出逐日收益（Backtrader analyzer 或我们自己算的）
+    # 逐日收益
     tr = results[0].analyzers.timeret.get_analysis()
     if tr:
         retdf = pd.DataFrame({"datetime": list(tr.keys()), "ret": list(tr.values())})
@@ -756,7 +895,7 @@ def main():
         retdf = eq[["datetime","ret"]].copy()
     retdf.to_csv(out_dir / "portfolio_returns.csv", index=False)
 
-    # 逐日诊断导出
+    # 逐日诊断
     diagdf = pd.DataFrame(strat.diag_daily).drop_duplicates(subset=["datetime"]).sort_values("datetime")
     diagdf.to_csv(out_dir / "per_day_ext.csv", index=False)
 
@@ -772,14 +911,14 @@ def main():
     cagr = float((eq["value"].iloc[-1] / eq["value"].iloc[0]) ** (252.0 / max(1, len(eq))) - 1.0) if len(eq) > 1 else float('nan')
     mdd = float(dd.get('max', {}).get('drawdown', np.nan))
 
-    # 诊断聚合
     turn_mean = float(diagdf["turnover_post"].mean()) if "turnover_post" in diagdf else float('nan')
     turn_p90  = float(diagdf["turnover_post"].quantile(0.9)) if "turnover_post" in diagdf else float('nan')
     adv_hit_days = float((diagdf["adv_clip_names"] > 0).mean()) if "adv_clip_names" in diagdf else 0.0
     adv_clip_avg = float(diagdf["adv_clip_ratio"].replace([np.inf,-np.inf], np.nan).fillna(0.0).mean()) if "adv_clip_ratio" in diagdf else 0.0
     gross_long_avg  = float(diagdf["gross_long"].mean()) if "gross_long" in diagdf else float('nan')
     gross_short_avg = float(diagdf["gross_short"].mean()) if "gross_short" in diagdf else float('nan')
-    # 长短腿 Sharpe（用我们拆分的日度贡献）
+
+    # 长短腿 Sharpe（用拆分的日度贡献）
     if {"ret_long","ret_short"} <= set(diagdf.columns):
         rl = diagdf["ret_long"].to_numpy()
         rs = diagdf["ret_short"].to_numpy()
@@ -795,6 +934,12 @@ def main():
         "top_k": args.top_k, "short_k": args.short_k,
         "long_exposure": args.long_exposure, "short_exposure": args.short_exposure,
         "commission_bps": args.commission_bps, "slippage_bps": args.slippage_bps,
+        "per_share_commission": args.per_share_commission,
+        "per_share_exchange_fee": args.per_share_exchange_fee,
+        "sec_fee_per_million": args.sec_fee_per_million,
+        "auction_spread_bps_open": args.auction_spread_bps_open,
+        "auction_spread_bps_close": args.auction_spread_bps_close,
+        "borrow_bps_ann": args.borrow_bps_ann,
         "trade_at": args.trade_at, "neutralize": [s for s in [s.strip() for s in args.neutralize.split(",")] if s],
         "membership_buffer": args.membership_buffer, "smooth_eta": args.smooth_eta,
         "days": int(len(eq)), "CAGR": cagr, "Sharpe": sharpe, "MDD_pct": mdd,
@@ -810,15 +955,15 @@ def main():
         json.dump(summary, f, indent=2)
     print("[summary]", json.dumps(summary, indent=2))
 
-    # 额外 KPI 导出
     kpis = {
         "turnover_mean": turn_mean,
         "turnover_p90": turn_p90,
-        "adv_clip_days_frac": adv_hit_days,     # 有裁剪的天数占比
-        "adv_clip_ratio_avg": adv_clip_avg,     # 被裁剪的换手占比（对有目标换手的截面）
+        "adv_clip_days_frac": adv_hit_days,
+        "adv_clip_ratio_avg": adv_clip_avg,
         "gross_long_avg": gross_long_avg,
         "gross_short_avg": gross_short_avg,
         "commission_total": float(results[0]._commission_cum if hasattr(results[0], "_commission_cum") else 0.0),
+        "borrow_total": float(results[0]._borrow_cum if hasattr(results[0], "_borrow_cum") else 0.0),
         "sharpe_long": sharpe_long,
         "sharpe_short": sharpe_short,
     }
