@@ -11,6 +11,8 @@ data/data/sp500/
 data/data/sp500_1min/
 data/data/sp500_5min/
 
+reports/
+
 # 数据文件（所有层级）
 data/**/*.csv
 data/**/*.parquet

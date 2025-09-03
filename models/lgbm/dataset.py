@@ -8,11 +8,17 @@ models/lgbm/dataset.py
 - 逐日横截面预处理：winsor → zscore（可选）
 - 训练期标签中性化（y ~ exposures，取残差）
 - 构建训练集（X, y）与推理用单日截面（X_t）
+
+稳健性
+- 兼容 instrument/datetime 可能出现在索引或被命名为别名（symbol/ticker、date/timestamp）
+- 兼容 pandas 版本差异的 groupby.apply 行为
+- dataclass 使用 default_factory 以兼容 Python 3.12
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple, Union
+from pathlib import Path
 import warnings
 import numpy as np
 import pandas as pd
@@ -25,7 +31,7 @@ import pandas as pd
 class NeutralizeConfig:
     enable: bool = True
     on: str = "label"  # "label" | "features" | "scores"
-    exposures: Sequence[str] = ()  # 支持通配符，如 ["mkt_beta_60","ln_mktcap","ind_*"]
+    exposures: Sequence[str] = ()  # 支持通配符，如 ["mkt_beta_60","ln_mktcap","ind_*","liq_bucket_*"]
     ridge_lambda: float = 1e-8
     center_exposures: bool = True
     drop_dummy: bool = True  # 对 one-hot 组自动 drop 1 列
@@ -35,7 +41,7 @@ class NeutralizeConfig:
 class PreprocessConfig:
     winsor: float = 0.01         # 逐日截面 winsor 百分位；0 关闭
     zscore: bool = True          # 逐日截面标准化
-    neutralize: NeutralizeConfig = field(default_factory=NeutralizeConfig)  # <-- 修正
+    neutralize: NeutralizeConfig = field(default_factory=NeutralizeConfig)
 
 
 @dataclass
@@ -56,8 +62,8 @@ class DataConfig:
 
 @dataclass
 class Config:
-    data: DataConfig = field(default_factory=DataConfig)                 # <-- 修正
-    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)  # <-- 修正
+    data: DataConfig = field(default_factory=DataConfig)
+    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
 
 
 # -----------------------------
@@ -69,6 +75,7 @@ def _get_close_col(df: pd.DataFrame) -> str:
     if "close" in df.columns:
         return "close"
     raise KeyError("未找到 $close/close 列。请检查 features parquet。")
+
 
 def _expand_wildcards(all_cols: Sequence[str], patterns: Sequence[str]) -> List[str]:
     cols = []
@@ -86,18 +93,101 @@ def _expand_wildcards(all_cols: Sequence[str], patterns: Sequence[str]) -> List[
     out = []
     for c in cols:
         if c not in seen:
-            out.append(c); seen.add(c)
+            out.append(c)
+            seen.add(c)
     return out
 
+
 def _groupby_apply(df: pd.DataFrame, key: str, func):
-    """兼容 pandas <2.1 / >=2.1 的 groupby.apply include_groups 参数差异"""
-    gb = df.groupby(key, group_keys=False)
+    """
+    兼容：key 既可能是列名，也可能是索引层级名。
+    优先按列分组；若不在列中则尝试按索引 level 分组。
+    并在返回后确保 key 仍然是列（若丢失则按索引对齐拼回）。
+    """
+    cols = set(df.columns)
+    idx_names = list(getattr(df.index, "names", []) or [])
+    if key in cols:
+        gb = df.groupby(key, group_keys=False)
+        key_is_column = True
+    elif key in idx_names:
+        gb = df.groupby(level=key, group_keys=False)
+        key_is_column = False
+    else:
+        raise KeyError(f"{key} not found in columns or index levels; "
+                       f"columns={list(df.columns)[:10]}..., index_names={idx_names}")
+
     try:
-        return gb.apply(func, include_groups=False)
+        res = gb.apply(func, include_groups=False)
     except TypeError:
+        # 兼容老版本 pandas
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=FutureWarning)
-            return gb.apply(func)
+            res = gb.apply(func)
+
+    # 确保 key 作为列存在
+    if isinstance(res, pd.DataFrame) and key not in res.columns:
+        if key_is_column and key in df.columns:
+            # 索引对齐拼回
+            res = res.join(df[[key]], how="left")
+        elif (not key_is_column) and key in idx_names:
+            # 如果 key 在原索引层级上，reset 一次索引再保证列存在
+            if key in list(getattr(res.index, "names", []) or []):
+                res = res.reset_index()
+            # 若还没列，尝试从原 df 取
+            if key not in res.columns and key in df.columns:
+                res = res.join(df[[key]], how="left")
+    return res
+
+
+def _coerce_inst_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将不同命名/索引形态的 instrument/datetime 统一为标准列。
+    """
+    d = df.copy()
+
+    # 如果 instrument 在索引里
+    if "instrument" not in d.columns:
+        idx_names = list(getattr(d.index, "names", []) or [])
+        if "instrument" in idx_names:
+            d = d.reset_index()
+
+    # 常见别名 → instrument
+    if "instrument" not in d.columns:
+        for cand in ["symbol", "ticker", "Instrument", "Symbol", "TICKER"]:
+            if cand in d.columns:
+                d = d.rename(columns={cand: "instrument"})
+                break
+
+    # 如果 datetime 在索引里
+    if "datetime" not in d.columns:
+        idx_names = list(getattr(d.index, "names", []) or [])
+        if "datetime" in idx_names:
+            d = d.reset_index()
+
+    # 常见别名 → datetime
+    if "datetime" not in d.columns:
+        for cand in ["date", "Date", "timestamp", "Timestamp", "DATETIME"]:
+            if cand in d.columns:
+                d = d.rename(columns={cand: "datetime"})
+                break
+
+    # 规范类型
+    if "instrument" in d.columns:
+        d["instrument"] = d["instrument"].astype(str).str.upper()
+    if "datetime" in d.columns:
+        d["datetime"] = pd.to_datetime(d["datetime"], utc=False, errors="coerce")
+
+    return d
+
+
+def _ensure_datetime_column(df: pd.DataFrame) -> pd.DataFrame:
+    """若 datetime 在索引上，则 reset 成列；保证存在 datetime 列。"""
+    d = df.copy()
+    if "datetime" not in d.columns and "datetime" in (getattr(d.index, "names", []) or []):
+        d = d.reset_index()
+    if "datetime" not in d.columns:
+        raise KeyError("缺少 datetime 列；请检查上游数据。")
+    return d
 
 
 # -----------------------------
@@ -116,46 +206,46 @@ class CrossSectionProcessor:
         return x.clip(lo, hi)
 
     def winsorize(self, df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+        """
+        使用 transform 逐列逐日处理，避免 groupby.apply 丢列。
+        """
         if not self.winsor or self.winsor <= 0:
             return df
         cols = [c for c in cols if c in df.columns]
         if not cols:
             return df
-
-        def _f(g: pd.DataFrame) -> pd.DataFrame:
-            gg = g.copy()
-            for c in cols:
-                s = gg[c].astype(float)
-                gg[c] = self._winsorize_vec(s, self.winsor)
-            return gg
-
-        return _groupby_apply(df, "datetime", _f)
+        out = df.copy()
+        g = out.groupby("datetime")
+        for c in cols:
+            out[c] = g[c].transform(lambda s: self._winsorize_vec(s.astype(float), self.winsor))
+        return out
 
     def zscore(self, df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+        """
+        使用 transform 逐列逐日标准化，避免 groupby.apply 丢列。
+        """
         if not self.do_z:
             return df
         cols = [c for c in cols if c in df.columns]
         if not cols:
             return df
-
-        def _f(g: pd.DataFrame) -> pd.DataFrame:
-            gg = g.copy()
-            for c in cols:
-                s = gg[c].astype(float)
-                mu = s.mean()
-                sd = s.std(ddof=0)
-                if not np.isfinite(sd) or sd == 0:
-                    gg[c] = 0.0
-                else:
-                    gg[c] = (s - mu) / sd
-            return gg
-
-        return _groupby_apply(df, "datetime", _f)
+        out = df.copy()
+        g = out.groupby("datetime")
+        for c in cols:
+            s = out[c].astype(float)
+            mu = g[c].transform("mean")
+            # 使用 ddof=0 的方差
+            var0 = g[c].transform(lambda x: x.astype(float).var(ddof=0))
+            sd = np.sqrt(var0)
+            # 0 方差 → 置 0
+            z = (s - mu) / sd.replace(0, np.nan)
+            out[c] = z.fillna(0.0)
+        return out
 
     @staticmethod
     def _auto_drop_dummy(expos_cols: List[str]) -> List[str]:
         """
-        简单按前缀归组并每组 drop 最后一列，避免 dummy trap
+        简单按前缀归组并每组 drop 最后一列，避免 dummy trap。
         """
         prefixes = ["ind_", "size_bucket_", "liq_bucket_"]
         keep = expos_cols.copy()
@@ -248,6 +338,7 @@ class CrossSectionProcessor:
             gg[target_col] = resid
             return gg
 
+        # 仍用 _groupby_apply，但它现在会在必要时把 key 拼回列
         return _groupby_apply(df, "datetime", _f)
 
 
@@ -297,12 +388,24 @@ class DatasetBuilder:
     # ---------- 数据载入 & 过滤 ----------
     def load_features(self, path: Optional[str] = None) -> pd.DataFrame:
         path = path or self.cfg.data.features_path
-        df = pd.read_parquet(path)
+        p = Path(path)
+        if not p.is_absolute():
+            # 把相对路径视为 “项目根目录” 相对路径
+            repo_root = Path(__file__).resolve().parents[2]  # models/lgbm/ 上两级就是仓库根
+            p = (repo_root / p).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"features parquet 不存在：{p}")
+
+        df = pd.read_parquet(p)
+        # 统一 instrument/datetime（容错别名/索引）
+        df = _coerce_inst_datetime(df)
+
         required = {"instrument", "datetime"}
         if not required <= set(df.columns):
-            raise ValueError(f"features 缺列：{required - set(df.columns)}")
-        df["instrument"] = df["instrument"].astype(str).str.upper()
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=False)
+            have = list(df.columns)
+            idxn = getattr(df.index, "names", None)
+            raise ValueError(f"features 缺列：{required - set(df.columns)} | "
+                             f"现有列示例：{have[:30]} | index names={idxn}")
 
         # 时间裁剪
         mask = (df["datetime"] >= pd.Timestamp(self.cfg.data.start)) & \
@@ -313,6 +416,7 @@ class DatasetBuilder:
         close_col = _get_close_col(df)
         if self.cfg.data.min_price is not None:
             df = df[df[close_col] >= float(self.cfg.data.min_price)]
+
         vwap_col = "$vwap" if "$vwap" in df.columns else ("vwap" if "vwap" in df.columns else None)
         if vwap_col is not None and "adv_20" in df.columns and self.cfg.data.min_adv_usd is not None:
             adv_usd = (df["adv_20"].astype(float) * df[vwap_col].astype(float))
@@ -338,19 +442,27 @@ class DatasetBuilder:
         start = start or self.cfg.data.start
         end = end or self.cfg.data.end
         label = self.cfg.data.label
-        if label not in df.columns:
-            raise KeyError(f"label 列不存在：{label}")
 
-        m = (df["datetime"] >= pd.Timestamp(start)) & (df["datetime"] <= pd.Timestamp(end))
-        d = df.loc[m].copy()
+        # 强校验 & 兜底
+        must = {"instrument", "datetime", label}
+        missing = must - set(df.columns)
+        if missing:
+            raise KeyError(
+                f"build_train_xy 需要列 {must}，但当前缺少：{missing}。"
+                "很可能你在进入 build_train_xy 前做了列筛选，把 datetime 或 instrument 丢了。"
+            )
+        d = df.loc[(df["datetime"] >= pd.Timestamp(start)) & (df["datetime"] <= pd.Timestamp(end))].copy()
+        d = _ensure_datetime_column(d)
 
         feats_all = list(d.columns)
-        feats = feature_cols or self.cfg.data.features
+        feats = list(feature_cols) if feature_cols else list(self.cfg.data.features)
         feats = list(_expand_wildcards(feats_all, feats))
 
+        # 横截面 winsor & zscore
         d = self.cs.winsorize(d, feats)
         d = self.cs.zscore(d, feats)
 
+        # 标签中性化（可选）
         if use_resid_label and self.cfg.preprocess.neutralize.enable and self.cfg.preprocess.neutralize.on == "label":
             expos = list(_expand_wildcards(feats_all, self.cfg.preprocess.neutralize.exposures))
             if expos:
@@ -362,6 +474,7 @@ class DatasetBuilder:
                 )
 
         cols_need = feats + [label, "instrument", "datetime"]
+        cols_need = [c for c in cols_need if c in d.columns]  # 防御
         d = d[cols_need]
         if drop_na:
             d = d.dropna(subset=feats + [label])
@@ -378,13 +491,15 @@ class DatasetBuilder:
         date: Union[str, pd.Timestamp],
         feature_cols: Optional[Sequence[str]] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        # 兜底：保证 datetime 是列
+        d0 = _ensure_datetime_column(df)
         dt = pd.Timestamp(date)
-        d = df[df["datetime"] == dt].copy()
+        d = d0[d0["datetime"] == dt].copy()
         if d.empty:
             raise ValueError(f"指定日期无数据：{dt}")
 
         feats_all = list(d.columns)
-        feats = feature_cols or self.cfg.data.features
+        feats = list(feature_cols) if feature_cols else list(self.cfg.data.features)
         feats = list(_expand_wildcards(feats_all, feats))
 
         d = self.cs.winsorize(d, feats)
