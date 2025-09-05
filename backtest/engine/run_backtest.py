@@ -11,13 +11,25 @@ run_backtest.py  (v3.4.1 with diagnostics + short-leg timing + hard-cap water-fi
 """
 
 from __future__ import annotations
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 import pandas as pd
 import numpy as np
 import backtrader as bt
 import qlib
 from qlib.data import D
+import yaml  # pip install pyyaml
+
+# --- fallback: allow running this file directly without -m by injecting project root ---
+try:
+    _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+except Exception:
+    pass
+
+# external selection module
+from strategies.stock_selection import select_members_with_buffer
 
 
 # ----------------------------- Utils -----------------------------
@@ -133,7 +145,7 @@ def compute_vol_adv_maps(features_path: str, universe: set[str], dates: list[pd.
         vol["sigma"] = vol.groupby("instrument", group_keys=False)["sigma"].shift(1)
         vol = vol.dropna(subset=["sigma"])
         if not vol.empty:
-            vol_map = {pd.Timestamp(d).normalize(): g[["instrument","sigma"]].reset_index(drop=True)
+            vol_map = {pd.Timestamp(d).normalize() : g[["instrument","sigma"]].reset_index(drop=True)
                        for d, g in vol.groupby("datetime") if pd.Timestamp(d).normalize() in set(dates)}
 
     # ADV$
@@ -188,7 +200,7 @@ def neutralize_weights(targets: dict[str, float], expos_df: pd.DataFrame,
     return out
 
 
-# --------- NEW: Water-filling 单腿分配 + 两腿封装 ----------
+# --------- Water-filling 单腿分配 + 两腿封装 ----------
 def _waterfill_one_leg(raw_pos: dict[str, float], target_sum: float, cap: float | dict[str,float]) -> dict[str, float]:
     """raw_pos>=0 的目标，按 cap 做硬上限分配，使和=target_sum（若不可行则全封顶）。"""
     raw = {k: max(0.0, float(v)) for k, v in raw_pos.items() if float(v) > 0}
@@ -209,7 +221,6 @@ def _waterfill_one_leg(raw_pos: dict[str, float], target_sum: float, cap: float 
     while A:
         denom = sum(raw[k] for k in A)
         if denom <= 0:
-            # 原始权重全 0：平均分剩余
             share = R / len(A)
             for k in list(A):
                 take = min(share, caps.get(k, np.inf))
@@ -308,12 +319,15 @@ class XSecRebalance(bt.Strategy):
         ridge_lambda=1e-6,
 
         trade_at="open",
+        # 从 config/CLI 来
         top_k=50, short_k=50,
+        membership_buffer=0.2,
+        selection_use_rank_mode="auto",  # "auto" | "rank" | "score"
+
         long_exposure=1.0, short_exposure=-1.0,
         max_pos_per_name=0.05,
         weight_scheme="equal",
 
-        membership_buffer=0.2,
         smooth_eta=0.6,
 
         target_vol=0.0,
@@ -391,49 +405,18 @@ class XSecRebalance(bt.Strategy):
 
     # ----- Helpers -----
     def _members_with_buffer(self, g: pd.DataFrame) -> tuple[list[str], list[str], pd.DataFrame]:
-        buf = float(self.p.membership_buffer or 0.0)
-        top_k = int(self.p.top_k); short_k = int(self.p.short_k)
-        g = g.copy()
-
-        use_rank = ("rank" in g.columns and
-                    pd.to_numeric(g["rank"], errors="coerce").notna().sum() >= max(1, top_k + short_k))
-
-        if use_rank:
-            g["rank"] = pd.to_numeric(g["rank"], errors="coerce")
-            g = g.sort_values("rank", na_position="last", kind="mergesort")
-            # longs
-            enter_long_thr = top_k
-            exit_long_thr  = int(np.ceil(top_k * (1.0 + buf)))
-            longs_enter = set(g.head(enter_long_thr)["instrument"])
-            longs_keep = {ins for ins, w in self.prev_weights.items() if w > 0}
-            longs_ok = set(g[g["rank"] <= exit_long_thr]["instrument"])
-            longs = list((longs_enter | (longs_keep & longs_ok)) if top_k > 0 else set())
-            # shorts
-            g_tail = g.iloc[::-1].copy()
-            enter_short_thr = short_k
-            exit_short_thr  = int(np.ceil(short_k * (1.0 + buf)))
-            shorts_enter = set(g_tail.head(enter_short_thr)["instrument"])
-            shorts_keep = {ins for ins, w in self.prev_weights.items() if w < 0}
-            shorts_ok = set(g_tail[g_tail["rank"] <= exit_short_thr]["instrument"])
-            shorts = list((shorts_enter | (shorts_keep & shorts_ok)) if short_k > 0 else set())
-        else:
-            g = g.dropna(subset=["score"]).sort_values("score", ascending=False)
-            longs_enter = set(g.head(top_k)["instrument"])
-            exit_idx = int(np.ceil(top_k * (1.0 + buf)))
-            longs_exit_zone = set(g.head(exit_idx)["instrument"])
-            longs_keep = {ins for ins, w in self.prev_weights.items() if w > 0}
-            longs = list((longs_enter | (longs_keep & longs_exit_zone)) if top_k > 0 else set())
-
-            g_rev = g.iloc[::-1]
-            shorts_enter = set(g_rev.head(short_k)["instrument"])
-            exit_idx_s = int(np.ceil(short_k * (1.0 + buf)))
-            shorts_exit_zone = set(g_rev.head(exit_idx_s)["instrument"])
-            shorts_keep = {ins for ins, w in self.prev_weights.items() if w < 0}
-            shorts = list((shorts_enter | (shorts_keep & shorts_exit_zone)) if short_k > 0 else set())
-
-        if self.reb_counter < 10 and self.p.verbose:
-            print(f"[rebalance {self.reb_counter}] longs={len(longs)} shorts={len(shorts)} (candidates={len(g)})")
-        return longs, shorts, g
+        """委托到 strategies.stock_selection.select_members_with_buffer。"""
+        longs, shorts, g_sorted = select_members_with_buffer(
+            g=g,
+            prev_weights=getattr(self, "prev_weights", {}) or {},
+            top_k=int(self.p.top_k),
+            short_k=int(self.p.short_k),
+            membership_buffer=float(self.p.membership_buffer or 0.0),
+            use_rank_mode=str(getattr(self.p, "selection_use_rank_mode", "auto")),
+            reb_counter=int(getattr(self, "reb_counter", 0)),
+            verbose=bool(self.p.verbose),
+        )
+        return longs, shorts, g_sorted
 
     # ----- Core -----
     def next(self):
@@ -491,7 +474,7 @@ class XSecRebalance(bt.Strategy):
         g = self._preds.get(dtoday)
         if g is None or g.empty:
             if self.p.verbose:
-                print(f"[warn] no predictions for exec day {dtoday.date()]}")
+                print(f"[warn] no predictions for exec day {dtoday.date()}")
             self.diag_daily.append({
                 "datetime": dtoday, "ret": total_ret, "ret_long": long_ret, "ret_short": short_ret,
                 "turnover_pre": 0.0, "turnover_post": 0.0,
@@ -657,6 +640,9 @@ class XSecRebalance(bt.Strategy):
 # ----------------------------- CLI & main -----------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config/config.yaml", help="YAML 配置文件路径（可选）")
+    ap.add_argument("--strategy_key", default=None, help="从 config.strategies 选择一个 key 覆盖参数")
+
     ap.add_argument("--qlib_dir", required=True)
     ap.add_argument("--preds", required=True)
     ap.add_argument("--features_path", required=True)
@@ -669,14 +655,16 @@ def parse_args():
     ap.add_argument("--neutralize", default="", help="beta,sector,liq,size")
     ap.add_argument("--ridge_lambda", type=float, default=1e-6)
 
-    ap.add_argument("--top_k", type=int, default=50)
-    ap.add_argument("--short_k", type=int, default=50)
+    # 由 config 决定，CLI 仅在传入时覆盖
+    ap.add_argument("--top_k", type=int, default=None)
+    ap.add_argument("--short_k", type=int, default=None)
+    ap.add_argument("--membership_buffer", type=float, default=None)
+
     ap.add_argument("--long_exposure", type=float, default=1.0)
     ap.add_argument("--short_exposure", type=float, default=-1.0)
     ap.add_argument("--max_pos_per_name", type=float, default=0.05)
     ap.add_argument("--weight_scheme", choices=["equal","icdf"], default="equal")
 
-    ap.add_argument("--membership_buffer", type=float, default=0.2)
     ap.add_argument("--smooth_eta", type=float, default=0.6)
 
     ap.add_argument("--target_vol", type=float, default=0.0, help="年化目标波动 (0 关闭)")
@@ -690,13 +678,13 @@ def parse_args():
     ap.add_argument("--cash", type=float, default=1_000_000.0)
     ap.add_argument("--anchor_symbol", default="SPY")
 
-    # NEW: 短腿择时参数（动量 ≤ 阈值时允许做空；信号用 T-1）
-    ap.add_argument("--short_timing_mom63", action="store_true", help="启用短腿择时：SPY 63日动量≤阈值时允许做空（用T-1信息）")
-    ap.add_argument("--short_timing_threshold", type=float, default=0.0, help="短腿择时动量阈值，默认0.0")
-    ap.add_argument("--short_timing_lookback", type=int, default=63, help="短腿择时回看窗口，默认63")
+    # NEW: 短腿择时参数
+    ap.add_argument("--short_timing_mom63", action="store_true")
+    ap.add_argument("--short_timing_threshold", type=float, default=0.0)
+    ap.add_argument("--short_timing_lookback", type=int, default=63)
 
-    # NEW: 硬上限开关（由 CLI 控制；不再强制 True）
-    ap.add_argument("--hard_cap", action="store_true", help="使用硬上限 water-filling 单票上限分配")
+    # NEW: 硬上限开关
+    ap.add_argument("--hard_cap", action="store_true")
 
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--verbose", action="store_true")
@@ -739,6 +727,39 @@ def main():
     args = parse_args()
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- 读取 YAML ---
+    cfg = {}
+    cfg_path = Path(getattr(args, "config", "config/config.yaml")).expanduser()
+    if cfg_path.exists():
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+
+    # selection: base -> key -> CLI 覆盖
+    sel_base = (cfg.get("selection") or {})
+    strategies_cfg = (cfg.get("strategies") or {})
+    active_strategy_key = None
+    if args.strategy_key:
+        if args.strategy_key not in strategies_cfg:
+            avail = ", ".join(sorted(strategies_cfg.keys())) or "(none)"
+            raise RuntimeError(f"strategy_key '{args.strategy_key}' 不存在。可选：{avail}")
+        active_strategy_key = args.strategy_key
+        sel_from_key = (strategies_cfg[args.strategy_key].get("selection") or {})
+    else:
+        sel_from_key = {}
+
+    sel_cfg = {**sel_base, **sel_from_key}
+    if args.top_k is not None:
+        sel_cfg["top_k"] = int(args.top_k)
+    if args.short_k is not None:
+        sel_cfg["short_k"] = int(args.short_k)
+    if args.membership_buffer is not None:
+        sel_cfg["membership_buffer"] = float(args.membership_buffer)
+
+    sel_top_k    = int(sel_cfg.get("top_k", 50))
+    sel_short_k  = int(sel_cfg.get("short_k", 50))
+    sel_buffer   = float(sel_cfg.get("membership_buffer", 0.2))
+    sel_use_rank = str(sel_cfg.get("use_rank", "auto")).strip().lower()
 
     # 预测
     preds_all = ensure_inst_dt(pd.read_parquet(Path(args.preds).expanduser().resolve()))
@@ -852,11 +873,16 @@ def main():
         neutralize_items=tuple(neutral_list),
         ridge_lambda=args.ridge_lambda,
         trade_at=args.trade_at,
-        top_k=args.top_k, short_k=args.short_k,
+
+        # 来自 config/CLI 合并
+        top_k=sel_top_k,
+        short_k=sel_short_k,
+        membership_buffer=sel_buffer,
+        selection_use_rank_mode=sel_use_rank,
+
         long_exposure=args.long_exposure, short_exposure=args.short_exposure,
         max_pos_per_name=args.max_pos_per_name,
         weight_scheme=args.weight_scheme,
-        membership_buffer=args.membership_buffer,
         smooth_eta=args.smooth_eta,
         target_vol=args.target_vol,
         leverage_cap=args.leverage_cap,
@@ -864,7 +890,7 @@ def main():
         # NEW
         short_timing_on=bool(args.short_timing_mom63),
         short_timing_dates=short_allow_dates,
-        hard_cap=bool(args.hard_cap),  # 修复：尊重 CLI，默认 False，仅传入时启用
+        hard_cap=bool(args.hard_cap),
         verbose=args.verbose,
     )
     cerebro.addanalyzer(bt.analyzers.TimeReturn, timeframe=bt.TimeFrame.Days, _name='timeret', fund=False)
@@ -924,11 +950,13 @@ def main():
         "start": args.start, "end": args.end,
         "cash_init": float(eq["value"].iloc[0]) if len(eq) else float(args.cash),
         "cash_end": float(eq["value"].iloc[-1]) if len(eq) else float(args.cash),
-        "top_k": args.top_k, "short_k": args.short_k,
+        "top_k": sel_top_k, "short_k": sel_short_k,
+        "membership_buffer": sel_buffer,
+        "selection_use_rank_mode": sel_use_rank,
         "long_exposure": args.long_exposure, "short_exposure": args.short_exposure,
         "commission_bps": args.commission_bps, "slippage_bps": args.slippage_bps,
         "trade_at": args.trade_at, "neutralize": [s for s in [s.strip() for s in args.neutralize.split(",")] if s],
-        "membership_buffer": args.membership_buffer, "smooth_eta": args.smooth_eta,
+        "smooth_eta": args.smooth_eta,
         "days": int(len(eq)), "CAGR": cagr, "Sharpe": sharpe, "MDD_pct": mdd,
         "rebalance_days": len(set(list(results[0].p.preds_by_exec.keys()))),
         "universe_size": len(price_map),

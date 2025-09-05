@@ -106,21 +106,22 @@ python run_backtest.py \
 ### B. Long-only（T+1、简洁稳健基线）
 
 ```bash
-python run_backtest.py
-–qlib_dir ~/qlib/us_data
-–preds ~/data/preds.parquet
-–features_path ~/data/features.parquet
-–start 2020-01-01 --end 2024-12-31
-–trade_at open --exec_lag 1
-–top_k 50 --short_k 0
-–long_exposure 1.0 --short_exposure 0.0
-–weight_scheme equal
-–membership_buffer 0.25 --smooth_eta 0.70
-–neutralize “beta,sector,liq,size”
-–target_vol 0.12 --leverage_cap 2.0
-–max_pos_per_name 0.03 --hard_cap
-–adv_limit_pct 0.005
-–out_dir ./runs/long_Tplus1_eq_cap
+python -m backtest.engine.run_backtest \
+  --qlib_dir ~/.qlib/qlib_data/us_data \
+  --preds artifacts/preds/weekly/preds_2020_2024.parquet \
+  --features_path artifacts/features_day.parquet \
+  --start 2020-01-01 --end 2024-12-31 \
+  --trade_at open --exec_lag 1 \
+  --top_k 50 --short_k 0 \
+  --long_exposure 1.0 --short_exposure 0.0 \
+  --weight_scheme equal \
+  --membership_buffer 0.25 --smooth_eta 0.70 \
+  --neutralize "beta,sector,liq,size" \
+  --target_vol 0.12 --leverage_cap 2.0 \
+  --max_pos_per_name 0.03 --hard_cap \
+  --adv_limit_pct 0.005 \
+  --out_dir ./runs/long_Tplus1_eq_cap
+
 ```
 
 **为何推荐**  

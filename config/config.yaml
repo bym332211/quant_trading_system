@@ -1,70 +1,101 @@
 # config/config.yaml
-seed: 42
+# seed: 42
 
-paths:
-  qlib_dir: "/home/ec2-user/.qlib/qlib_data/us_data"     # 日频库
-  features_day: "artifacts/features_day.parquet"         # 特征/标签产物
-  preds_dir: "artifacts/preds/weekly"                    # 预测输出目录
-  reports_dir: "backtest/reports"                        # 回测报告目录（回测侧用）
+# paths:
+#   qlib_dir: "/home/ec2-user/.qlib/qlib_data/us_data"     # 日频库
+#   features_day: "artifacts/features_day.parquet"         # 特征/标签产物
+#   preds_dir: "artifacts/preds/weekly"                    # 预测输出目录
+#   reports_dir: "backtest/reports"                        # 回测报告目录（回测侧用）
 
-universe:
-  instruments_file: "~/.qlib/qlib_data/us_data/instruments/all.txt"  # 可留空
-  min_adv: 1_000_000          # 过滤低流动性（按美元或股数，视你实现）
+# universe:
+#   instruments_file: "~/.qlib/qlib_data/us_data/instruments/all.txt"  # 可留空
+#   min_adv: 1_000_000          # 过滤低流动性（按美元或股数，视你实现）
 
-data:
-  freq: "day"
-  price_cols: ["$open","$high","$low","$close","$vwap","$volume"]
-  label: "y_fwd_5"            # 周频标签
-  features:                   # 可继续扩充
-    - mom_20
-    - mom_60
-    - vol_20
-    - vol_60
-    - rng_hl
-    - logv
-    - logv_zn_20
-    - adv_20
-    - vwap_spread
-    - oc
-    - upper_shadow
-    - lower_shadow
-    - ma5_gap
-    - ma20_gap
+# data:
+#   freq: "day"
+#   price_cols: ["$open","$high","$low","$close","$vwap","$volume"]
+#   label: "y_fwd_5"            # 周频标签
+#   features:                   # 可继续扩充
+#     - mom_20
+#     - mom_60
+#     - vol_20
+#     - vol_60
+#     - rng_hl
+#     - logv
+#     - logv_zn_20
+#     - adv_20
+#     - vwap_spread
+#     - oc
+#     - upper_shadow
+#     - lower_shadow
+#     - ma5_gap
+#     - ma20_gap
 
-preprocess:
-  winsor: 0.01                # 横截面去极值阈
-  zscore: true
-  neutralize:
-    enable: true
-    exposures: ["mkt_beta_60", "mkt_beta_60", "ln_dollar_vol_20", "ind_*"]             # 若特征包含 ln_mktcap / beta / sector_onehot 可填，比如 ["ln_mktcap"],如果有行业，再加 ind_*
+# preprocess:
+#   winsor: 0.01                # 横截面去极值阈
+#   zscore: true
+#   neutralize:
+#     enable: true
+#     exposures: ["mkt_beta_60", "mkt_beta_60", "ln_dollar_vol_20", "ind_*"]             # 若特征包含 ln_mktcap / beta / sector_onehot 可填，比如 ["ln_mktcap"],如果有行业，再加 ind_*
 
-walk_forward:
-  # 严格时序：训练起点 → 首次调仓（初次窗口必须覆盖足够样本）
-  train_start: "2014-01-01"
-  first_rebalance: "2017-01-06"   # 第一周五；之后按 weekday 滚动
-  end_date: "2024-12-31"
-  rebalance_weekday: 4            # 0=Mon ... 4=Fri
-  min_train_obs: 50000            # 横截面样本数阈值，防止太少就训练
-  max_train_years: null           # 可选：设置为 5 做滑窗；null=扩窗
+# walk_forward:
+#   # 严格时序：训练起点 → 首次调仓（初次窗口必须覆盖足够样本）
+#   train_start: "2014-01-01"
+#   first_rebalance: "2017-01-06"   # 第一周五；之后按 weekday 滚动
+#   end_date: "2024-12-31"
+#   rebalance_weekday: 4            # 0=Mon ... 4=Fri
+#   min_train_obs: 50000            # 横截面样本数阈值，防止太少就训练
+#   max_train_years: null           # 可选：设置为 5 做滑窗；null=扩窗
 
-model:
-  type: "lgbm"
-  params:
-    n_estimators: 400
-    learning_rate: 0.05
-    max_depth: -1
-    num_leaves: 63
-    subsample: 0.8
-    colsample_bytree: 0.8
-    reg_lambda: 1.0
-    reg_alpha: 0.0
-    min_child_samples: 80
-  early_stopping: 50
-  test_size_per_date: 0.0   # 横截面不切分单日；用时间滚动做 OOS
+# model:
+#   type: "lgbm"
+#   params:
+#     n_estimators: 400
+#     learning_rate: 0.05
+#     max_depth: -1
+#     num_leaves: 63
+#     subsample: 0.8
+#     colsample_bytree: 0.8
+#     reg_lambda: 1.0
+#     reg_alpha: 0.0
+#     min_child_samples: 80
+#   early_stopping: 50
+#   test_size_per_date: 0.0   # 横截面不切分单日；用时间滚动做 OOS
 
-ranking:
-  top_k: 20
-  use_weight_hint: false
+# ranking:
+#   top_k: 20
+#   use_weight_hint: false
 
-outputs:
-  write_rank_
+# outputs:
+#   write_rank_
+
+
+# 全局默认（可选）
+selection:
+  top_k: 50
+  short_k: 0
+  membership_buffer: 0.25
+  use_rank: "auto"   # "auto" | "rank" | "score"
+
+# 可切换策略集合
+strategies:
+  long_only_baseline:
+    selection:
+      top_k: 50
+      short_k: 0
+      membership_buffer: 0.25
+      use_rank: "auto"
+
+  long_short_tv08:
+    selection:
+      top_k: 40
+      short_k: 8
+      membership_buffer: 0.40
+      use_rank: "auto"
+
+  icdf_aggressive:
+    selection:
+      top_k: 80
+      short_k: 20
+      membership_buffer: 0.20
+      use_rank: "rank"
