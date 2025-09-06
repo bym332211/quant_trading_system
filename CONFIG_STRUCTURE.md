@@ -10,7 +10,7 @@
 - `membership_buffer`: 换手缓冲比例
 - `use_rank`: 排名使用模式 ("auto" | "rank" | "score")
 
-### 2. 入场策略配置 (entry_strategies)
+### 2. 入场策略配置 (entry)
 - `neutralize_items`: 中性化项目列表 ["beta", "sector", "size", "liq"]
 - `ridge_lambda`: 岭回归参数
 - `long_exposure`: 多头暴露度
@@ -22,7 +22,7 @@
 - `leverage_cap`: 杠杆上限
 - `hard_cap`: 是否使用硬上限
 
-### 3. 出场策略配置 (exit_strategies)
+### 3. 出场策略配置 (exit)
 包含两个主要出场策略：
 
 #### 技术指标止损 (tech_stop_loss)
@@ -85,7 +85,7 @@ strategies:
       membership_buffer: 0.3
       use_rank: "auto"
     
-    entry_strategies:
+    entry:
       neutralize_items: ["beta", "sector"]
       ridge_lambda: 1e-6
       long_exposure: 1.0
@@ -97,7 +97,7 @@ strategies:
       leverage_cap: 2.0
       hard_cap: true
     
-    exit_strategies:
+    exit:
       tech_stop_loss:
         atr_multiplier: 2.0
         atr_period: 14
