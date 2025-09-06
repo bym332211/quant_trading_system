@@ -180,7 +180,8 @@ class BacktestRunner:
             short_timing_dates=data["short_allow_dates"],
             hard_cap=bool(self.config["entry"]["hard_cap"]),
             verbose=bool(self.args["verbose"]),
-            
+            # 入场策略配置
+            entry_strategies_config = self.config["entry"],
             # 出场策略配置
             exit_strategies_config=self.config["exit"],
         )
