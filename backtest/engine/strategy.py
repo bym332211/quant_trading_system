@@ -8,7 +8,8 @@ import numpy as np
 import backtrader as bt
 
 # external selection module
-from strategies import EntryStrategy, ExitStrategyCoordinator
+from strategies import ExitStrategyCoordinator
+from strategies.entry_strategies import EntryStrategyCoordinator
 
 # 数据加载模块中的工具函数
 from backtest.engine.data_loader import apply_adv_limit
@@ -52,6 +53,9 @@ class XSecRebalance(bt.Strategy):
 
         # 出场策略配置
         exit_strategies_config=None,
+        
+        # 入场策略配置
+        entry_strategies_config=None,
 
         verbose=False,
     )
@@ -83,22 +87,18 @@ class XSecRebalance(bt.Strategy):
             self.broker.set_coc(True)
 
         # === 入场策略实例 ===
-        self.entry = EntryStrategy(
-            neutralize_items=self._neutral,
-            ridge_lambda=float(self.p.ridge_lambda),
-            top_k=int(self.p.top_k),
-            short_k=int(self.p.short_k),
-            membership_buffer=float(self.p.membership_buffer or 0.0),
-            selection_use_rank_mode=str(getattr(self.p, "selection_use_rank_mode", "auto")),
-            long_exposure=float(self.p.long_exposure),
-            short_exposure=float(self.p.short_exposure),
-            max_pos_per_name=float(self.p.max_pos_per_name or 0.0),
-            weight_scheme=str(self.p.weight_scheme),
-            smooth_eta=float(self.p.smooth_eta or 0.0),
-            target_vol=float(self.p.target_vol or 0.0),
-            leverage_cap=float(self.p.leverage_cap or 10.0),
-            hard_cap=bool(self.p.hard_cap),
-            verbose=bool(self.p.verbose),
+        # 存储入场策略配置（用于后续初始化）
+        self._entry_strategies_config = getattr(self.p, "entry_strategies_config", {})
+        
+        # 初始化入场策略协调器
+        icdf_equal_config = self._entry_strategies_config.get("icdf_equal", {})
+        enabled_strategies = self._entry_strategies_config.get("enabled_strategies", ["icdf_equal"])
+        strategy_weights = self._entry_strategies_config.get("strategy_weights", {"icdf_equal": 1.0})
+        
+        self.entry = EntryStrategyCoordinator(
+            icdf_equal_config=icdf_equal_config,
+            enabled_strategies=enabled_strategies,
+            strategy_weights=strategy_weights
         )
         
         # 存储出场策略配置（用于后续初始化）
@@ -396,23 +396,18 @@ class XSecRebalance(bt.Strategy):
         self._neutral = tuple(self.p.neutralize_items) if self.p.neutralize_items else tuple()
         self._short_allow = set(self.p.short_timing_dates) if self.p.short_timing_dates else set()
         
-        # 重新初始化入场策略
-        self.entry = EntryStrategy(
-            neutralize_items=self._neutral,
-            ridge_lambda=float(self.p.ridge_lambda),
-            top_k=int(self.p.top_k),
-            short_k=int(self.p.short_k),
-            membership_buffer=float(self.p.membership_buffer or 0.0),
-            selection_use_rank_mode=str(getattr(self.p, "selection_use_rank_mode", "auto")),
-            long_exposure=float(self.p.long_exposure),
-            short_exposure=float(self.p.short_exposure),
-            max_pos_per_name=float(self.p.max_pos_per_name or 0.0),
-            weight_scheme=str(self.p.weight_scheme),
-            smooth_eta=float(self.p.smooth_eta or 0.0),
-            target_vol=float(self.p.target_vol or 0.0),
-            leverage_cap=float(self.p.leverage_cap or 10.0),
-            hard_cap=bool(self.p.hard_cap),
-            verbose=bool(self.p.verbose),
+        # 存储入场策略配置
+        self._entry_strategies_config = config.get("entry", {})
+        
+        # 重新初始化入场策略协调器
+        icdf_equal_config = self._entry_strategies_config.get("icdf_equal", {})
+        enabled_strategies = self._entry_strategies_config.get("enabled_strategies", ["icdf_equal"])
+        strategy_weights = self._entry_strategies_config.get("strategy_weights", {"icdf_equal": 1.0})
+        
+        self.entry = EntryStrategyCoordinator(
+            icdf_equal_config=icdf_equal_config,
+            enabled_strategies=enabled_strategies,
+            strategy_weights=strategy_weights
         )
         
         # 存储出场策略配置
@@ -519,4 +514,9 @@ class XSecRebalance(bt.Strategy):
     def update_state(self, new_weights: Dict[str, float]) -> None:
         """更新策略状态"""
         self.prev_weights = new_weights.copy()
+        # 更新协调器的状态
         self.entry.prev_weights = new_weights.copy()
+        # 更新各个策略的状态
+        for strategy in self.entry.strategies.values():
+            if hasattr(strategy, 'prev_weights'):
+                strategy.prev_weights = new_weights.copy()

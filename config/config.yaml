@@ -80,17 +80,28 @@ strategies:
       membership_buffer: 0.25
       use_rank: "auto"   # "auto" | "rank" | "score"
     
-    entry_strategies:
-      neutralize_items: ["beta", "sector"]
-      ridge_lambda: 1e-6
-      long_exposure: 1.0
-      short_exposure: -1.0
-      max_pos_per_name: 0.05
-      weight_scheme: "equal"
-      smooth_eta: 0.6
-      target_vol: 0.0
-      leverage_cap: 2.0
-      hard_cap: false
+    entry:
+      # 入场策略协调器配置
+      enabled_strategies: ["icdf_equal"]
+      strategy_weights:
+        icdf_equal: 1.0
+      
+      # ICDF/等权重策略配置
+      icdf_equal:
+        neutralize_items: ["beta", "sector"]
+        ridge_lambda: 1e-6
+        top_k: 50
+        short_k: 0
+        membership_buffer: 0.25
+        selection_use_rank_mode: "auto"
+        long_exposure: 1.0
+        short_exposure: -1.0
+        max_pos_per_name: 0.05
+        weight_scheme: "equal"
+        smooth_eta: 0.6
+        target_vol: 0.0
+        leverage_cap: 2.0
+        hard_cap: false
     
     exit_strategies:
       tech_stop_loss:
@@ -122,17 +133,28 @@ strategies:
       membership_buffer: 0.25
       use_rank: "auto"   # "auto" | "rank" | "score"
     
-    entry_strategies:
-      neutralize_items: ["beta", "sector"]
-      ridge_lambda: 1e-6
-      long_exposure: 1.0
-      short_exposure: -1.0
-      max_pos_per_name: 0.05
-      weight_scheme: "equal"
-      smooth_eta: 0.6
-      target_vol: 0.0
-      leverage_cap: 2.0
-      hard_cap: false
+    entry:
+      # 入场策略协调器配置
+      enabled_strategies: ["icdf_equal"]
+      strategy_weights:
+        icdf_equal: 1.0
+      
+      # ICDF/等权重策略配置
+      icdf_equal:
+        neutralize_items: ["beta", "sector"]
+        ridge_lambda: 1e-6
+        top_k: 50
+        short_k: 0
+        membership_buffer: 0.25
+        selection_use_rank_mode: "auto"
+        long_exposure: 1.0
+        short_exposure: -1.0
+        max_pos_per_name: 0.05
+        weight_scheme: "equal"
+        smooth_eta: 0.6
+        target_vol: 0.0
+        leverage_cap: 2.0
+        hard_cap: false
     
     exit_strategies:
       tech_stop_loss:
@@ -164,17 +186,28 @@ strategies:
       membership_buffer: 0.40
       use_rank: "auto"
     
-    entry_strategies:
-      neutralize_items: ["beta", "sector", "size"]
-      ridge_lambda: 1e-6
-      long_exposure: 1.0
-      short_exposure: -0.8
-      max_pos_per_name: 0.04
-      weight_scheme: "equal"
-      smooth_eta: 0.7
-      target_vol: 0.15
-      leverage_cap: 1.5
-      hard_cap: true
+    entry:
+      # 入场策略协调器配置
+      enabled_strategies: ["icdf_equal"]
+      strategy_weights:
+        icdf_equal: 1.0
+      
+      # ICDF/等权重策略配置
+      icdf_equal:
+        neutralize_items: ["beta", "sector", "size"]
+        ridge_lambda: 1e-6
+        top_k: 40
+        short_k: 8
+        membership_buffer: 0.40
+        selection_use_rank_mode: "auto"
+        long_exposure: 1.0
+        short_exposure: -0.8
+        max_pos_per_name: 0.04
+        weight_scheme: "equal"
+        smooth_eta: 0.7
+        target_vol: 0.15
+        leverage_cap: 1.5
+        hard_cap: true
     
     exit_strategies:
       tech_stop_loss:
@@ -206,17 +239,28 @@ strategies:
       membership_buffer: 0.20
       use_rank: "rank"
     
-    entry_strategies:
-      neutralize_items: ["beta", "sector", "size", "liq"]
-      ridge_lambda: 1e-5
-      long_exposure: 1.2
-      short_exposure: -0.8
-      max_pos_per_name: 0.03
-      weight_scheme: "icdf"
-      smooth_eta: 0.5
-      target_vol: 0.20
-      leverage_cap: 2.5
-      hard_cap: true
+    entry:
+      # 入场策略协调器配置
+      enabled_strategies: ["icdf_equal"]
+      strategy_weights:
+        icdf_equal: 1.0
+      
+      # ICDF/等权重策略配置
+      icdf_equal:
+        neutralize_items: ["beta", "sector", "size", "liq"]
+        ridge_lambda: 1e-5
+        top_k: 80
+        short_k: 20
+        membership_buffer: 0.20
+        selection_use_rank_mode: "rank"
+        long_exposure: 1.2
+        short_exposure: -0.8
+        max_pos_per_name: 0.03
+        weight_scheme: "icdf"
+        smooth_eta: 0.5
+        target_vol: 0.20
+        leverage_cap: 2.5
+        hard_cap: true
     
     exit_strategies:
       tech_stop_loss:
