@@ -103,7 +103,7 @@ strategies:
         leverage_cap: 2.0
         hard_cap: false
     
-    exit_strategies:
+    exit:
       tech_stop_loss:
         atr_multiplier: 2.0
         atr_period: 14
@@ -156,7 +156,7 @@ strategies:
         leverage_cap: 2.0
         hard_cap: false
     
-    exit_strategies:
+    exit:
       tech_stop_loss:
         atr_multiplier: 2.0
         atr_period: 14
@@ -209,7 +209,7 @@ strategies:
         leverage_cap: 1.5
         hard_cap: true
     
-    exit_strategies:
+    exit:
       tech_stop_loss:
         atr_multiplier: 1.8
         atr_period: 10
@@ -262,7 +262,7 @@ strategies:
         leverage_cap: 2.5
         hard_cap: true
     
-    exit_strategies:
+    exit:
       tech_stop_loss:
         atr_multiplier: 2.2
         atr_period: 20
