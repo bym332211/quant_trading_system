@@ -18,7 +18,12 @@ import numpy as np
 import backtrader as bt
 import qlib
 from qlib.data import D
+from strategies.entry_strategy import EntryStrategy
+from strategies import ExitStrategyCoordinator
 import yaml  # pip install pyyaml
+
+# KPI计算模块
+from backtest.kpi.calculator import KPICalculator
 
 # --- fallback: allow running this file directly without -m by injecting project root ---
 try:
@@ -29,7 +34,7 @@ except Exception:
     pass
 
 # external selection module
-from strategies.stock_selection import select_members_with_buffer
+from strategies import select_members_with_buffer, EntryStrategy
 
 
 # ----------------------------- Utils -----------------------------
@@ -158,109 +163,10 @@ def compute_vol_adv_maps(features_path: str, universe: set[str], dates: list[pd.
     return vol_map, adv_map
 
 
-def neutralize_weights(targets: dict[str, float], expos_df: pd.DataFrame,
-                       ridge_lambda: float = 1e-6, drop_dummy: bool = True,
-                       keep_cols: list[str] | None = None) -> dict[str, float]:
-    if expos_df is None or expos_df.empty or not targets:
-        return targets.copy()
-    df = expos_df.copy()
-    cols = [c for c in df.columns if c not in ("instrument","datetime")]
-    if keep_cols:
-        cols = [c for c in cols if c in keep_cols]
-    if not cols:
-        return targets.copy()
-    tdf = pd.DataFrame({"instrument": list(targets.keys()), "w": list(targets.values())})
-    tdf["instrument"] = tdf["instrument"].astype(str).str.upper()
-    dfm = tdf.merge(df[["instrument"] + cols], on="instrument", how="left").dropna()
-    if dfm.empty:
-        return targets.copy()
-    use_cols = []
-    for c in cols:
-        v = dfm[c].to_numpy()
-        if not np.allclose(v, v[0]):
-            use_cols.append(c)
-    if drop_dummy:
-        for prefix in ("ind_", "liq_bucket_"):
-            cand = [c for c in use_cols if c.startswith(prefix)]
-            if len(cand) > 1:
-                use_cols.remove(sorted(cand)[-1])
-    if not use_cols:
-        return targets.copy()
-    X = dfm[use_cols].to_numpy(dtype=float)
-    y = dfm["w"].to_numpy(dtype=float)
-    try:
-        XtX = X.T @ X
-        beta = np.linalg.solve(XtX + ridge_lambda * np.eye(XtX.shape[0]), X.T @ y)
-    except np.linalg.LinAlgError:
-        return targets.copy()
-    resid = y - X @ beta
-    out = {ins: float(w) for ins, w in zip(dfm["instrument"], resid)}
-    for k, v in targets.items():
-        out.setdefault(k, float(v))
-    return out
 
 
-# --------- Water-filling 单腿分配 + 两腿封装 ----------
-def _waterfill_one_leg(raw_pos: dict[str, float], target_sum: float, cap: float | dict[str,float]) -> dict[str, float]:
-    """raw_pos>=0 的目标，按 cap 做硬上限分配，使和=target_sum（若不可行则全封顶）。"""
-    raw = {k: max(0.0, float(v)) for k, v in raw_pos.items() if float(v) > 0}
-    if not raw or target_sum <= 0:
-        return {k: 0.0 for k in raw_pos}
-    # caps
-    if isinstance(cap, dict):
-        caps = {k: float(cap.get(k, np.inf)) for k in raw.keys()}
-    else:
-        caps = {k: float(cap) for k in raw.keys()}
-    # 不可行：总 cap < 目标
-    if sum(caps.values()) + 1e-12 < float(target_sum):
-        return {k: caps.get(k, 0.0) for k in raw_pos}
-    A = set(raw.keys())
-    w = {k: 0.0 for k in raw_pos}
-    R = float(target_sum)
-    # 循环 water-filling
-    while A:
-        denom = sum(raw[k] for k in A)
-        if denom <= 0:
-            share = R / len(A)
-            for k in list(A):
-                take = min(share, caps.get(k, np.inf))
-                w[k] = take
-            break
-        s = R / denom
-        overflow = [k for k in A if s * raw[k] > caps.get(k, np.inf) + 1e-15]
-        if not overflow:
-            for k in A:
-                w[k] = s * raw[k]
-            break
-        for k in overflow:
-            w[k] = caps.get(k, np.inf)
-        R -= sum(caps.get(k, np.inf) for k in overflow)
-        A -= set(overflow)
-        if R <= 1e-15:  # 刚好分完
-            break
-    # 保持原 keys
-    for k in raw_pos:
-        w.setdefault(k, 0.0)
-    return w
 
 
-def waterfill_two_legs(weights: dict[str,float], long_exposure: float, short_exposure: float,
-                       max_pos_per_name: float, allow_shorts: bool = True) -> dict[str,float]:
-    """把净权重拆两腿做 water-filling，然后合并。"""
-    w = pd.Series(weights, dtype=float)
-    pos_raw = {k: float(v) for k,v in w[w>0].items()}
-    neg_raw = {k: float(-v) for k,v in w[w<0].items()}  # 用正数做空腿分配
-    cap = float(max(0.0, max_pos_per_name or 0.0))
-    # 多腿
-    wL = _waterfill_one_leg(pos_raw, max(0.0, float(long_exposure)), cap)
-    # 空腿
-    target_short = max(0.0, float(-short_exposure)) if allow_shorts else 0.0
-    wS_pos = _waterfill_one_leg(neg_raw, target_short, cap) if target_short > 0 else {k:0.0 for k in neg_raw}
-    # 合并
-    out = {k: 0.0 for k in weights}
-    for k,v in wL.items(): out[k] = out.get(k,0.0) + float(v)
-    for k,v in wS_pos.items(): out[k] = out.get(k,0.0) - float(v)
-    return out
 
 
 def apply_adv_limit(prev_w: dict[str,float], tgt_w: dict[str,float],
@@ -292,19 +198,6 @@ def apply_adv_limit(prev_w: dict[str,float], tgt_w: dict[str,float],
     return out, diag
 
 
-def icdf_weights(ranks: np.ndarray) -> np.ndarray:
-    """
-    ranks: 1..K  (1=最好)
-    返回未经缩放的 shape(K,) 权重，按 Φ^{-1}((r-0.5)/(K+1)) 计算，越靠前越大
-    """
-    def erfinv(x):
-        a = 0.147
-        ln = np.log(1 - x**2)
-        s = np.sign(x)
-        return s * np.sqrt(np.sqrt((2/(np.pi*a) + ln/2)**2 - ln/a) - (2/(np.pi*a) + ln/2))
-    p = (ranks - 0.5) / (len(ranks) + 1.0)
-    z = np.sqrt(2.0) * erfinv(2*p - 1)
-    return z
 
 
 # ----------------------------- Strategy -----------------------------
@@ -334,11 +227,11 @@ class XSecRebalance(bt.Strategy):
         leverage_cap=2.0,
         adv_limit_pct=0.0,
 
-        # NEW: 短腿择时
+        # 短腿择时
         short_timing_on=False,
         short_timing_dates=None,   # set of dates 允许做空
 
-        # NEW: 硬上限
+        # 硬上限
         hard_cap=False,
 
         verbose=False,
@@ -369,6 +262,25 @@ class XSecRebalance(bt.Strategy):
 
         if str(self.p.trade_at).lower() == "close":
             self.broker.set_coc(True)
+
+        # === 入场策略实例 ===
+        self.entry = EntryStrategy(
+            neutralize_items=self._neutral,
+            ridge_lambda=float(self.p.ridge_lambda),
+            top_k=int(self.p.top_k),
+            short_k=int(self.p.short_k),
+            membership_buffer=float(self.p.membership_buffer or 0.0),
+            selection_use_rank_mode=str(getattr(self.p, "selection_use_rank_mode", "auto")),
+            long_exposure=float(self.p.long_exposure),
+            short_exposure=float(self.p.short_exposure),
+            max_pos_per_name=float(self.p.max_pos_per_name or 0.0),
+            weight_scheme=str(self.p.weight_scheme),
+            smooth_eta=float(self.p.smooth_eta or 0.0),
+            target_vol=float(self.p.target_vol or 0.0),
+            leverage_cap=float(self.p.leverage_cap or 10.0),
+            hard_cap=bool(self.p.hard_cap),
+            verbose=bool(self.p.verbose),
+        )
 
     # ----- Backtrader callbacks -----
     def notify_order(self, order):
@@ -402,21 +314,6 @@ class XSecRebalance(bt.Strategy):
             self.order_records.append(rec)
             if self.p.verbose:
                 print("[trade]", rec)
-
-    # ----- Helpers -----
-    def _members_with_buffer(self, g: pd.DataFrame) -> tuple[list[str], list[str], pd.DataFrame]:
-        """委托到 strategies.stock_selection.select_members_with_buffer。"""
-        longs, shorts, g_sorted = select_members_with_buffer(
-            g=g,
-            prev_weights=getattr(self, "prev_weights", {}) or {},
-            top_k=int(self.p.top_k),
-            short_k=int(self.p.short_k),
-            membership_buffer=float(self.p.membership_buffer or 0.0),
-            use_rank_mode=str(getattr(self.p, "selection_use_rank_mode", "auto")),
-            reb_counter=int(getattr(self, "reb_counter", 0)),
-            verbose=bool(self.p.verbose),
-        )
-        return longs, shorts, g_sorted
 
     # ----- Core -----
     def next(self):
@@ -452,6 +349,79 @@ class XSecRebalance(bt.Strategy):
                 self.pos_records.append({"datetime": dtoday, "instrument": d._name,
                                          "size": float(pos.size), "price": float(pos.price),
                                          "value": float(pos.size * d.close[0])})
+        
+        # ---------- 出场策略检查（每日执行） ----------
+        # 初始化出场策略协调器（如果尚未初始化）
+        if not hasattr(self, 'exit_coordinator'):
+            self.exit_coordinator = ExitStrategyCoordinator(
+                tech_stop_loss_config={
+                    "atr_multiplier": 2.0,
+                    "atr_period": 14,
+                    "ma_stop_period": 20,
+                    "bollinger_period": 20,
+                    "bollinger_std": 2.0,
+                    "rsi_period": 14,
+                    "rsi_overbought": 70.0,
+                    "rsi_oversold": 30.0
+                },
+                volatility_exit_config={
+                    "vol_multiplier": 2.0,
+                    "vol_period": 20,
+                    "market_vol_period": 63,
+                    "vol_filter_threshold": 0.3,
+                    "max_position_days": 63
+                }
+            )
+        
+        # 检查每个持仓是否需要出场
+        exit_symbols = []
+        for d in self.datas:
+            pos = self.getposition(d)
+            if pos.size != 0:
+                symbol = d._name
+                current_price = float(d.close[0])
+                
+                # 获取历史价格数据（最近60天）
+                lookback = 60
+                if len(d) >= lookback:
+                    historical_data = pd.DataFrame({
+                        'open': [float(d.open[i]) for i in range(-lookback, 0)],
+                        'high': [float(d.high[i]) for i in range(-lookback, 0)],
+                        'low': [float(d.low[i]) for i in range(-lookback, 0)],
+                        'close': [float(d.close[i]) for i in range(-lookback, 0)],
+                        'volume': [float(d.volume[i]) for i in range(-lookback, 0)]
+                    }, index=pd.date_range(end=dtoday, periods=lookback, freq='D'))
+                    
+                    # 记录入场信息（如果尚未记录）
+                    if symbol not in self.exit_coordinator.entry_prices:
+                        # 使用平均入场价格
+                        entry_price = float(pos.price) if pos.price != 0 else current_price
+                        self.exit_coordinator.record_entry(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            position_size=float(pos.size),
+                            entry_date=dtoday
+                        )
+                    
+                    # 检查是否需要出场
+                    should_exit, triggered_strategies = self.exit_coordinator.should_exit(
+                        symbol=symbol,
+                        current_price=current_price,
+                        historical_data=historical_data,
+                        current_date=dtoday
+                    )
+                    
+                    if should_exit:
+                        exit_symbols.append((symbol, triggered_strategies))
+        
+        # 执行出场
+        for symbol, strategies in exit_symbols:
+            d = self.sym2data.get(symbol)
+            if d:
+                if self.p.verbose:
+                    print(f"[exit] {symbol} triggered by strategies: {strategies}")
+                self.order_target_percent(data=d, target=0.0)
+                self.exit_coordinator.record_exit(symbol)
 
         # ---------- 非执行日：记录后返回 ----------
         if dtoday not in self._exec:
@@ -470,7 +440,7 @@ class XSecRebalance(bt.Strategy):
             })
             return
 
-        # ---------- 选股 ----------
+        # ---------- 选股+入场权重：委托给 EntryStrategy ----------
         g = self._preds.get(dtoday)
         if g is None or g.empty:
             if self.p.verbose:
@@ -485,111 +455,28 @@ class XSecRebalance(bt.Strategy):
             })
             return
 
-        longs, shorts, g_sorted = self._members_with_buffer(g)
-
-        # 短腿择时：不允许做空则清空 short 候选
+        # 短腿择时：不允许做空则在入场策略中清空 short 候选
         allow_shorts_today = (not self.p.short_timing_on) or (dtoday in self._short_allow)
-        if not allow_shorts_today:
-            shorts = []
 
-        # ---------- 权重生成（raw） ----------
-        tgt = {}
-        if self.p.weight_scheme == "icdf":
-            if longs:
-                dfL = g_sorted[g_sorted["instrument"].isin(longs)].copy()
-                rankL = (np.arange(1, len(dfL)+1)).astype(float)
-                wL = icdf_weights(rankL)
-                wL = np.maximum(wL, 0.0)
-                if wL.sum() > 0:
-                    wL = wL / wL.sum() * max(0.0, float(self.p.long_exposure))
-                for ins, w in zip(dfL["instrument"], wL):
-                    tgt[ins] = tgt.get(ins, 0.0) + float(w)
-            if shorts:
-                dfS = g_sorted[g_sorted["instrument"].isin(shorts)].copy().iloc[::-1]
-                rankS = (np.arange(1, len(dfS)+1)).astype(float)
-                wS = -np.maximum(icdf_weights(rankS), 0.0)
-                if -wS.sum() > 0 and self.p.short_exposure < 0:
-                    wS = wS / (-wS.sum()) * float(self.p.short_exposure)
-                for ins, w in zip(dfS["instrument"], wS):
-                    tgt[ins] = tgt.get(ins, 0.0) + float(w)
-        else:
-            if len(longs) > 0 and self.p.long_exposure != 0.0:
-                w = float(self.p.long_exposure) / float(len(longs))
-                for s in longs: tgt[s] = tgt.get(s, 0.0) + w
-            if len(shorts) > 0 and self.p.short_exposure != 0.0:
-                w = float(self.p.short_exposure) / float(len(shorts))
-                for s in shorts: tgt[s] = tgt.get(s, 0.0) + w
-
-        # ---------- 中性化 ----------
-        keep_cols = []
-        if "beta" in self._neutral: keep_cols.append("mkt_beta_60")
-        if "size" in self._neutral: keep_cols.append("ln_dollar_vol_20")
-        expos_df = self._expos.get(dtoday)
-        if expos_df is not None:
-            if "sector" in self._neutral: keep_cols += [c for c in expos_df.columns if c.startswith("ind_")]
-            if "liq"    in self._neutral: keep_cols += [c for c in expos_df.columns if c.startswith("liq_bucket_")]
-        tgt = neutralize_weights(tgt, expos_df, ridge_lambda=self.p.ridge_lambda, drop_dummy=True, keep_cols=keep_cols)
-
-        # ---------- 平滑 ----------
-        eta = float(self.p.smooth_eta or 0.0)
-        if eta > 0 and getattr(self, "prev_weights", None):
-            w_prev_ser = pd.Series(self.prev_weights, dtype=float)
-            w_tgt_ser  = pd.Series(tgt, dtype=float)
-            all_idx = sorted(set(w_prev_ser.index) | set(w_tgt_ser.index))
-            w_prev_ser = w_prev_ser.reindex(all_idx).fillna(0.0)
-            w_tgt_ser  = w_tgt_ser.reindex(all_idx).fillna(0.0)
-            w_new = eta * w_prev_ser + (1.0 - eta) * w_tgt_ser
-            tgt = {k: float(v) for k, v in w_new.items()}
-
-        # ---------- 目标波动率（先做缩放，再做硬上限） ----------
-        tv = float(self.p.target_vol or 0.0)
-        if tv > 0:
-            sigma_df = self._vol.get(dtoday)
-            if sigma_df is not None and not sigma_df.empty:
-                sigmap = dict(zip(sigma_df["instrument"], sigma_df["sigma"]))
-                w = pd.Series(tgt, dtype=float)
-                s2 = np.array([ (sigmap.get(k, np.nan) or np.nan)**2 * (w.get(k,0.0)**2) for k in w.index ])
-                s2 = s2[~np.isnan(s2)]
-                if s2.size > 0 and np.nansum(s2) > 0:
-                    est_ann = float(np.sqrt(np.nansum(s2)) * np.sqrt(252.0))
-                    if est_ann > 1e-8:
-                        scale = min(float(self.p.leverage_cap or 10.0), tv / est_ann)
-                        w = (w * scale)
-                        tgt = {k: float(v) for k, v in w.clip(-1.0, 1.0).items()}
-
-        # ---------- 硬上限（water-filling） ----------
-        if self.p.hard_cap and (self.p.max_pos_per_name is not None) and self.p.max_pos_per_name > 0:
-            tgt = waterfill_two_legs(
-                tgt,
-                long_exposure=self.p.long_exposure,
-                short_exposure=self.p.short_exposure,
-                max_pos_per_name=float(self.p.max_pos_per_name),
-                allow_shorts=allow_shorts_today
-            )
-        else:
-            # 软上限回退：分别归一正负腿并裁剪
-            w = pd.Series(tgt, dtype=float)
-            w_pos = w[w>0]; w_neg = -w[w<0]
-            if w_pos.sum() > 0:
-                w_pos = w_pos / w_pos.sum() * max(0.0, float(self.p.long_exposure))
-            if w_neg.sum() > 0 and allow_shorts_today:
-                w_neg = w_neg / w_neg.sum() * max(0.0, float(-self.p.short_exposure))
-            else:
-                w_neg = w_neg * 0.0
-            w2 = pd.concat([w_pos, -w_neg]).reindex(w.index).fillna(0.0)
-            cap = float(self.p.max_pos_per_name or 0.0)
-            if cap > 0:
-                w2 = w2.clip(-cap, cap)
-            tgt = {k: float(v) for k,v in w2.items()}
-
-        # 为诊断记录 pre-ADV（硬上限后）
-        tgt_pre_adv = tgt.copy()
+        # 使用 EntryStrategy 生成“ADV 限速之前”的目标权重
+        tgt_pre_adv = self.entry.generate_entry_weights(
+            g=g,
+            prev_weights=self.prev_weights or {},
+            expos_df=self._expos.get(dtoday),
+            vol_df=self._vol.get(dtoday),
+            allow_shorts=allow_shorts_today,
+            reb_counter=int(self.reb_counter),
+        )
 
         # ---------- %ADV 限速 ----------
         adv_df = self._adv.get(dtoday)
-        tgt, diag_adv = apply_adv_limit(self.prev_weights, tgt, adv_df, self.broker.getvalue(), adv_limit_pct=float(self.p.adv_limit_pct))
+        tgt, diag_adv = apply_adv_limit(
+            self.prev_weights, tgt_pre_adv, adv_df,
+            self.broker.getvalue(), adv_limit_pct=float(self.p.adv_limit_pct)
+        )
 
         # ---------- 诊断：turnover / adv clip ----------
+        # 注意：此处使用“更新前”的 prev_weights 计算换手
         w_prev_ser = pd.Series(self.prev_weights, dtype=float)
         w_pre_ser  = pd.Series(tgt_pre_adv, dtype=float)
         w_post_ser = pd.Series(tgt, dtype=float)
@@ -613,7 +500,8 @@ class XSecRebalance(bt.Strategy):
             self.order_target_percent(data=d, target=float(tw))
         for d in self.datas:
             sym = d._name
-            if sym in tgt: continue
+            if sym in tgt: 
+                continue
             pos = self.getposition(d)
             if pos.size != 0:
                 self.order_target_percent(data=d, target=0.0)
@@ -633,7 +521,9 @@ class XSecRebalance(bt.Strategy):
             "commission_cum": float(self._commission_cum),
         })
 
+        # 同步 prev_weights（以 ADV 限速后的最终权重为准）
         self.prev_weights = tgt.copy()
+        self.entry.prev_weights = tgt.copy()
         self.reb_counter += 1
 
 
@@ -922,72 +812,26 @@ def main():
     pd.DataFrame(strat.order_records).to_csv(out_dir / "orders.csv", index=False)
     pd.DataFrame(strat.pos_records).to_csv(out_dir / "positions.csv", index=False)
 
-    # KPI
+    # KPI计算 - 使用新的KPICalculator模块
     dd = results[0].analyzers.dd.get_analysis()
-    ret = retdf["ret"].to_numpy()
-    ann = np.sqrt(252.0)
-    sharpe = float(np.nanmean(ret) / (np.nanstd(ret, ddof=1) + 1e-12) * ann) if len(ret) > 2 else float('nan')
-    cagr = float((eq["value"].iloc[-1] / eq["value"].iloc[0]) ** (252.0 / max(1, len(eq))) - 1.0) if len(eq) > 1 else float('nan')
-    mdd = float(dd.get('max', {}).get('drawdown', np.nan))
-
-    # 诊断聚合
-    turn_mean = float(diagdf["turnover_post"].mean()) if "turnover_post" in diagdf else float('nan')
-    turn_p90  = float(diagdf["turnover_post"].quantile(0.9)) if "turnover_post" in diagdf else float('nan')
-    adv_hit_days = float((diagdf["adv_clip_names"] > 0).mean()) if "adv_clip_names" in diagdf else 0.0
-    adv_clip_avg = float(diagdf["adv_clip_ratio"].replace([np.inf,-np.inf], np.nan).fillna(0.0).mean()) if "adv_clip_ratio" in diagdf else 0.0
-    gross_long_avg  = float(diagdf["gross_long"].mean()) if "gross_long" in diagdf else float('nan')
-    gross_short_avg = float(diagdf["gross_short"].mean()) if "gross_short" in diagdf else float('nan')
-    # 长短腿 Sharpe
-    if {"ret_long","ret_short"} <= set(diagdf.columns):
-        rl = diagdf["ret_long"].to_numpy()
-        rs = diagdf["ret_short"].to_numpy()
-        sharpe_long  = float(np.nanmean(rl) / (np.nanstd(rl, ddof=1) + 1e-12) * ann) if len(rl) > 2 else float('nan')
-        sharpe_short = float(np.nanmean(rs) / (np.nanstd(rs, ddof=1) + 1e-12) * ann) if len(rs) > 2 else float('nan')
-    else:
-        sharpe_long = sharpe_short = float('nan')
-
-    summary = {
-        "start": args.start, "end": args.end,
-        "cash_init": float(eq["value"].iloc[0]) if len(eq) else float(args.cash),
-        "cash_end": float(eq["value"].iloc[-1]) if len(eq) else float(args.cash),
-        "top_k": sel_top_k, "short_k": sel_short_k,
-        "membership_buffer": sel_buffer,
-        "selection_use_rank_mode": sel_use_rank,
-        "long_exposure": args.long_exposure, "short_exposure": args.short_exposure,
-        "commission_bps": args.commission_bps, "slippage_bps": args.slippage_bps,
-        "trade_at": args.trade_at, "neutralize": [s for s in [s.strip() for s in args.neutralize.split(",")] if s],
-        "smooth_eta": args.smooth_eta,
-        "days": int(len(eq)), "CAGR": cagr, "Sharpe": sharpe, "MDD_pct": mdd,
-        "rebalance_days": len(set(list(results[0].p.preds_by_exec.keys()))),
-        "universe_size": len(price_map),
-        "avg_candidates_per_reb": float(np.mean([len(g) for g in results[0].p.preds_by_exec.values()])),
-        "exec_lag": int(args.exec_lag),
-        "target_vol": float(args.target_vol),
-        "weight_scheme": args.weight_scheme,
-        "adv_limit_pct": float(args.adv_limit_pct),
-        "hard_cap": bool(args.hard_cap),
-        "short_timing_mom63": bool(args.short_timing_mom63),
-        "short_timing_threshold": float(args.short_timing_threshold),
-        "short_timing_lookback": int(args.short_timing_lookback),
-    }
-    with open(out_dir / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    commission_total = float(strat._commission_cum if hasattr(strat, "_commission_cum") else 0.0)
+    
+    # 使用KPICalculator计算所有指标
+    summary, kpis = KPICalculator.calculate_all_kpis(
+        args=args,
+        eq_df=eq,
+        ret_df=retdf,
+        diag_df=diagdf,
+        dd_analysis=dd,
+        strat=strat,
+        price_map=price_map,
+        sel_cfg=sel_cfg,
+        commission_total=commission_total
+    )
+    
+    # 保存KPI指标到文件
+    KPICalculator.save_kpis_to_files(out_dir, summary, kpis)
     print("[summary]", json.dumps(summary, indent=2))
-
-    # 额外 KPI 导出
-    kpis = {
-        "turnover_mean": turn_mean,
-        "turnover_p90": turn_p90,
-        "adv_clip_days_frac": adv_hit_days,
-        "adv_clip_ratio_avg": adv_clip_avg,
-        "gross_long_avg": gross_long_avg,
-        "gross_short_avg": gross_short_avg,
-        "commission_total": float(strat._commission_cum if hasattr(strat, "_commission_cum") else 0.0),
-        "sharpe_long": sharpe_long,
-        "sharpe_short": sharpe_short,
-    }
-    with open(out_dir / "kpis.json", "w") as f:
-        json.dump(kpis, f, indent=2)
     print(f"[saved] -> {out_dir}")
 
 if __name__ == "__main__":

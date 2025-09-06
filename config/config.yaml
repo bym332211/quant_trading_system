@@ -99,3 +99,26 @@ strategies:
       short_k: 20
       membership_buffer: 0.20
       use_rank: "rank"
+
+# 出场策略配置
+exit_strategies:
+  tech_stop_loss:
+    atr_multiplier: 2.0
+    atr_period: 14
+    ma_stop_period: 20
+    bollinger_period: 20
+    bollinger_std: 2.0
+    rsi_period: 14
+    rsi_overbought: 70.0
+    rsi_oversold: 30.0
+    enabled_methods: ["atr", "ma", "bollinger", "rsi"]
+  
+  volatility_exit:
+    vol_multiplier: 2.0
+    vol_period: 20
+    market_vol_period: 63
+    vol_filter_threshold: 0.3
+    max_position_days: 63
+    enabled_methods: ["vol_stop", "market_vol", "vol_filter", "time_exit"]
+  
+  enabled_strategies: ["tech_stop_loss", "volatility_exit"]
