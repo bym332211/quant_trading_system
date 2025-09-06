@@ -70,55 +70,137 @@
 #   write_rank_
 
 
-# 全局默认（可选）
-selection:
-  top_k: 50
-  short_k: 0
-  membership_buffer: 0.25
-  use_rank: "auto"   # "auto" | "rank" | "score"
-
-# 可切换策略集合
+# 全局默认策略配置
 strategies:
+  # 策略1：长线基础策略
   long_only_baseline:
     selection:
       top_k: 50
       short_k: 0
       membership_buffer: 0.25
-      use_rank: "auto"
+      use_rank: "auto"   # "auto" | "rank" | "score"
+    
+    entry_strategies:
+      neutralize_items: ["beta", "sector"]
+      ridge_lambda: 1e-6
+      long_exposure: 1.0
+      short_exposure: -1.0
+      max_pos_per_name: 0.05
+      weight_scheme: "equal"
+      smooth_eta: 0.6
+      target_vol: 0.0
+      leverage_cap: 2.0
+      hard_cap: false
+    
+    exit_strategies:
+      tech_stop_loss:
+        atr_multiplier: 2.0
+        atr_period: 14
+        ma_stop_period: 20
+        bollinger_period: 20
+        bollinger_std: 2.0
+        rsi_period: 14
+        rsi_overbought: 70.0
+        rsi_oversold: 30.0
+        enabled_methods: ["atr", "ma", "bollinger", "rsi"]
+      
+      volatility_exit:
+        vol_multiplier: 2.0
+        vol_period: 20
+        market_vol_period: 63
+        vol_filter_threshold: 0.3
+        max_position_days: 63
+        enabled_methods: ["vol_stop", "market_vol", "vol_filter", "time_exit"]
+      
+      enabled_strategies: ["tech_stop_loss", "volatility_exit"]
 
+  # 策略2：长短结合策略
   long_short_tv08:
     selection:
       top_k: 40
       short_k: 8
       membership_buffer: 0.40
       use_rank: "auto"
+    
+    entry_strategies:
+      neutralize_items: ["beta", "sector", "size"]
+      ridge_lambda: 1e-6
+      long_exposure: 1.0
+      short_exposure: -0.8
+      max_pos_per_name: 0.04
+      weight_scheme: "equal"
+      smooth_eta: 0.7
+      target_vol: 0.15
+      leverage_cap: 1.5
+      hard_cap: true
+    
+    exit_strategies:
+      tech_stop_loss:
+        atr_multiplier: 1.8
+        atr_period: 10
+        ma_stop_period: 15
+        bollinger_period: 20
+        bollinger_std: 1.8
+        rsi_period: 10
+        rsi_overbought: 75.0
+        rsi_oversold: 25.0
+        enabled_methods: ["atr", "ma", "bollinger"]
+      
+      volatility_exit:
+        vol_multiplier: 1.5
+        vol_period: 14
+        market_vol_period: 50
+        vol_filter_threshold: 0.25
+        max_position_days: 50
+        enabled_methods: ["vol_stop", "time_exit"]
+      
+      enabled_strategies: ["tech_stop_loss", "volatility_exit"]
 
+  # 策略3：ICDF激进策略
   icdf_aggressive:
     selection:
       top_k: 80
       short_k: 20
       membership_buffer: 0.20
       use_rank: "rank"
+    
+    entry_strategies:
+      neutralize_items: ["beta", "sector", "size", "liq"]
+      ridge_lambda: 1e-5
+      long_exposure: 1.2
+      short_exposure: -0.8
+      max_pos_per_name: 0.03
+      weight_scheme: "icdf"
+      smooth_eta: 0.5
+      target_vol: 0.20
+      leverage_cap: 2.5
+      hard_cap: true
+    
+    exit_strategies:
+      tech_stop_loss:
+        atr_multiplier: 2.2
+        atr_period: 20
+        ma_stop_period: 25
+        bollinger_period: 25
+        bollinger_std: 2.2
+        rsi_period: 14
+        rsi_overbought: 80.0
+        rsi_oversold: 20.0
+        enabled_methods: ["atr", "bollinger", "rsi"]
+      
+      volatility_exit:
+        vol_multiplier: 2.5
+        vol_period: 30
+        market_vol_period: 90
+        vol_filter_threshold: 0.35
+        max_position_days: 30
+        enabled_methods: ["vol_stop", "market_vol", "vol_filter"]
+      
+      enabled_strategies: ["tech_stop_loss", "volatility_exit"]
 
-# 出场策略配置
-exit_strategies:
-  tech_stop_loss:
-    atr_multiplier: 2.0
-    atr_period: 14
-    ma_stop_period: 20
-    bollinger_period: 20
-    bollinger_std: 2.0
-    rsi_period: 14
-    rsi_overbought: 70.0
-    rsi_oversold: 30.0
-    enabled_methods: ["atr", "ma", "bollinger", "rsi"]
-  
-  volatility_exit:
-    vol_multiplier: 2.0
-    vol_period: 20
-    market_vol_period: 63
-    vol_filter_threshold: 0.3
-    max_position_days: 63
-    enabled_methods: ["vol_stop", "market_vol", "vol_filter", "time_exit"]
-  
-  enabled_strategies: ["tech_stop_loss", "volatility_exit"]
+# 全局默认配置（向后兼容）
+selection:
+  top_k: 50
+  short_k: 0
+  membership_buffer: 0.25
+  use_rank: "auto"

@@ -18,8 +18,6 @@ import numpy as np
 import backtrader as bt
 import qlib
 from qlib.data import D
-from strategies.entry_strategy import EntryStrategy
-from strategies import ExitStrategyCoordinator
 import yaml  # pip install pyyaml
 
 # KPI计算模块
@@ -34,7 +32,7 @@ except Exception:
     pass
 
 # external selection module
-from strategies import select_members_with_buffer, EntryStrategy
+from strategies import select_members_with_buffer, EntryStrategy, ExitStrategyCoordinator
 
 
 # ----------------------------- Utils -----------------------------
@@ -234,6 +232,9 @@ class XSecRebalance(bt.Strategy):
         # 硬上限
         hard_cap=False,
 
+        # 出场策略配置
+        exit_strategies_config=None,
+
         verbose=False,
     )
 
@@ -281,6 +282,9 @@ class XSecRebalance(bt.Strategy):
             hard_cap=bool(self.p.hard_cap),
             verbose=bool(self.p.verbose),
         )
+        
+        # 存储出场策略配置（用于后续初始化）
+        self._exit_strategies_config = getattr(self.p, "exit_strategies_config", {})
 
     # ----- Backtrader callbacks -----
     def notify_order(self, order):
@@ -353,24 +357,15 @@ class XSecRebalance(bt.Strategy):
         # ---------- 出场策略检查（每日执行） ----------
         # 初始化出场策略协调器（如果尚未初始化）
         if not hasattr(self, 'exit_coordinator'):
+            # 从配置中获取出场策略参数
+            tech_stop_loss_config = self._exit_strategies_config.get("tech_stop_loss", {})
+            volatility_exit_config = self._exit_strategies_config.get("volatility_exit", {})
+            enabled_strategies = self._exit_strategies_config.get("enabled_strategies", ["tech_stop_loss", "volatility_exit"])
+            
             self.exit_coordinator = ExitStrategyCoordinator(
-                tech_stop_loss_config={
-                    "atr_multiplier": 2.0,
-                    "atr_period": 14,
-                    "ma_stop_period": 20,
-                    "bollinger_period": 20,
-                    "bollinger_std": 2.0,
-                    "rsi_period": 14,
-                    "rsi_overbought": 70.0,
-                    "rsi_oversold": 30.0
-                },
-                volatility_exit_config={
-                    "vol_multiplier": 2.0,
-                    "vol_period": 20,
-                    "market_vol_period": 63,
-                    "vol_filter_threshold": 0.3,
-                    "max_position_days": 63
-                }
+                tech_stop_loss_config=tech_stop_loss_config,
+                volatility_exit_config=volatility_exit_config,
+                enabled_strategies=enabled_strategies
             )
         
         # 检查每个持仓是否需要出场
@@ -625,20 +620,24 @@ def main():
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 
-    # selection: base -> key -> CLI 覆盖
-    sel_base = (cfg.get("selection") or {})
+    # 策略配置加载：支持新的分层结构
     strategies_cfg = (cfg.get("strategies") or {})
-    active_strategy_key = None
-    if args.strategy_key:
-        if args.strategy_key not in strategies_cfg:
-            avail = ", ".join(sorted(strategies_cfg.keys())) or "(none)"
-            raise RuntimeError(f"strategy_key '{args.strategy_key}' 不存在。可选：{avail}")
-        active_strategy_key = args.strategy_key
-        sel_from_key = (strategies_cfg[args.strategy_key].get("selection") or {})
+    active_strategy_key = args.strategy_key
+    
+    # 如果没有指定策略key，使用第一个策略或默认配置
+    if not active_strategy_key and strategies_cfg:
+        active_strategy_key = list(strategies_cfg.keys())[0]
+    
+    # 获取选股配置
+    sel_cfg = {}
+    if active_strategy_key and active_strategy_key in strategies_cfg:
+        strategy_cfg = strategies_cfg[active_strategy_key]
+        sel_cfg = strategy_cfg.get("selection", {})
     else:
-        sel_from_key = {}
-
-    sel_cfg = {**sel_base, **sel_from_key}
+        # 向后兼容：使用全局默认配置
+        sel_cfg = cfg.get("selection", {})
+    
+    # CLI参数覆盖配置
     if args.top_k is not None:
         sel_cfg["top_k"] = int(args.top_k)
     if args.short_k is not None:
@@ -650,6 +649,52 @@ def main():
     sel_short_k  = int(sel_cfg.get("short_k", 50))
     sel_buffer   = float(sel_cfg.get("membership_buffer", 0.2))
     sel_use_rank = str(sel_cfg.get("use_rank", "auto")).strip().lower()
+    
+    # 获取入场策略配置
+    entry_cfg = {}
+    if active_strategy_key and active_strategy_key in strategies_cfg:
+        strategy_cfg = strategies_cfg[active_strategy_key]
+        entry_cfg = strategy_cfg.get("entry_strategies", {})
+    
+    # 获取出场策略配置
+    exit_cfg = {}
+    if active_strategy_key and active_strategy_key in strategies_cfg:
+        strategy_cfg = strategies_cfg[active_strategy_key]
+        exit_cfg = strategy_cfg.get("exit_strategies", {})
+    
+    # 合并CLI参数与配置
+    neutralize_items = entry_cfg.get("neutralize_items", [])
+    ridge_lambda = entry_cfg.get("ridge_lambda", 1e-6)
+    long_exposure = entry_cfg.get("long_exposure", 1.0)
+    short_exposure = entry_cfg.get("short_exposure", -1.0)
+    max_pos_per_name = entry_cfg.get("max_pos_per_name", 0.05)
+    weight_scheme = entry_cfg.get("weight_scheme", "equal")
+    smooth_eta = entry_cfg.get("smooth_eta", 0.6)
+    target_vol = entry_cfg.get("target_vol", 0.0)
+    leverage_cap = entry_cfg.get("leverage_cap", 2.0)
+    hard_cap = entry_cfg.get("hard_cap", False)
+    
+    # CLI参数覆盖
+    if args.neutralize:
+        neutralize_items = [s.strip().lower() for s in args.neutralize.split(",") if s.strip()]
+    if args.ridge_lambda is not None:
+        ridge_lambda = args.ridge_lambda
+    if args.long_exposure is not None:
+        long_exposure = args.long_exposure
+    if args.short_exposure is not None:
+        short_exposure = args.short_exposure
+    if args.max_pos_per_name is not None:
+        max_pos_per_name = args.max_pos_per_name
+    if args.weight_scheme:
+        weight_scheme = args.weight_scheme
+    if args.smooth_eta is not None:
+        smooth_eta = args.smooth_eta
+    if args.target_vol is not None:
+        target_vol = args.target_vol
+    if args.leverage_cap is not None:
+        leverage_cap = args.leverage_cap
+    if args.hard_cap:
+        hard_cap = True
 
     # 预测
     preds_all = ensure_inst_dt(pd.read_parquet(Path(args.preds).expanduser().resolve()))
@@ -782,6 +827,9 @@ def main():
         short_timing_dates=short_allow_dates,
         hard_cap=bool(args.hard_cap),
         verbose=args.verbose,
+        
+        # 出场策略配置
+        exit_strategies_config=exit_cfg,
     )
     cerebro.addanalyzer(bt.analyzers.TimeReturn, timeframe=bt.TimeFrame.Days, _name='timeret', fund=False)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
