@@ -130,7 +130,7 @@ class BacktestRunner:
 
     def run_backtest(self, data: Dict[str, Any]) -> Any:
         """运行回测"""
-        from backtest.engine.strategy_registry import StrategyFactory
+        from strategies.base.strategy_registry import StrategyFactory
         
         # 从配置中获取策略配置
         strategy_config = self.config.get("strategy", {"name": "xsec_rebalance"})
