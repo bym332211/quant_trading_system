@@ -111,7 +111,7 @@ class ConfigLoader:
         exit_cfg = {}
         if active_strategy_key and active_strategy_key in strategies_cfg:
             strategy_cfg = strategies_cfg[active_strategy_key]
-            exit_cfg = strategy_cfg.get("exit_strategies", {})
+            exit_cfg = strategy_cfg.get("exit", {})
         
         # 合并CLI参数与配置
         neutralize_items = entry_cfg.get("neutralize_items", [])
