@@ -12,6 +12,19 @@ class BaseStrategy(ABC):
     """策略抽象基类 - 包含完整的交易流程"""
     
     @abstractmethod
+    def prepare_data(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        策略特定的数据准备
+        
+        Args:
+            config: 策略配置
+            
+        Returns:
+            准备好的数据字典
+        """
+        pass
+    
+    @abstractmethod
     def prepare(self, config: Dict[str, Any], data: Dict[str, Any]) -> None:
         """
         准备阶段：根据配置加载所有子模块

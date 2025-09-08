@@ -15,7 +15,7 @@ from strategies.entry_strategies import EntryStrategyCoordinator
 from backtest.engine.data_loader import apply_adv_limit
 
 # 策略基类
-from backtest.engine.base_strategy import BaseStrategy
+from strategies.base.base_strategy import BaseStrategy
 
 
 class XSecRebalance(bt.Strategy):
@@ -509,6 +509,68 @@ class XSecRebalance(bt.Strategy):
             "commission_cum": self._commission_cum,
             "reb_counter": self.reb_counter,
             "exit_stats": getattr(self.exit_coordinator, 'get_stats', lambda: {})()
+        }
+    
+    @classmethod
+    def prepare_data(cls, config: Dict[str, Any]) -> Dict[str, Any]:
+        """XSecRebalance 策略的数据准备"""
+        from backtest.engine.data_utils import (
+            prepare_predictions, prepare_price_data, prepare_execution_dates,
+            prepare_exposures, prepare_vol_adv, prepare_short_timing,
+            get_universe_from_predictions, filter_universe_by_mapped_predictions
+        )
+        
+        args = config["args"]
+        anchor_sym = args["anchor_symbol"].upper() if args.get("anchor_symbol") else None
+        
+        # 1. 准备预测数据
+        preds_by_src, preds_all = prepare_predictions(config)
+        
+        # 2. 获取初始universe
+        initial_universe = get_universe_from_predictions(preds_all, anchor_sym)
+        
+        # 3. 准备价格数据
+        price_map = prepare_price_data(config, initial_universe)
+        
+        # 4. 准备执行日期映射
+        exec2pred_src, exec_dates_set = prepare_execution_dates(config, price_map, preds_by_src)
+        
+        # 5. 过滤最终universe
+        mapped_src_days = set(exec2pred_src.values())
+        final_universe = filter_universe_by_mapped_predictions(preds_all, mapped_src_days, anchor_sym)
+        
+        # 6. 过滤价格数据
+        price_map = {sym: df for sym, df in price_map.items() if sym in final_universe}
+        
+        # 7. 准备按执行日分组的预测数据
+        preds_by_exec = {}
+        for ed, src in exec2pred_src.items():
+            g = preds_by_src.get(src)
+            if g is None: continue
+            g2 = g[g["instrument"].isin(price_map.keys())].copy()
+            preds_by_exec[pd.Timestamp(ed).normalize()] = g2
+        
+        # 8. 准备暴露数据
+        expos_map = prepare_exposures(config, final_universe, set(preds_by_exec.keys()))
+        
+        # 9. 准备波动率和ADV数据
+        vol_map, adv_map = prepare_vol_adv(config, final_universe, set(preds_by_exec.keys()))
+        
+        # 10. 准备短腿择时数据
+        short_allow_dates = prepare_short_timing(config, price_map, set(preds_by_exec.keys()))
+        
+        # 11. 中性化列表
+        neutral_list = [s.strip().lower() for s in args["neutralize"].split(",") if s.strip()]
+        
+        return {
+            "price_map": price_map,
+            "preds_by_exec": preds_by_exec,
+            "exec_dates": list(preds_by_exec.keys()),
+            "expos_map": expos_map,
+            "vol_map": vol_map,
+            "adv_map": adv_map,
+            "short_allow_dates": short_allow_dates,
+            "neutral_list": neutral_list,
         }
     
     def update_state(self, new_weights: Dict[str, float]) -> None:

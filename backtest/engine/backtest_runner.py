@@ -27,106 +27,20 @@ class BacktestRunner:
         self.args = config["args"]
         
     def prepare_data(self) -> Dict[str, Any]:
-        """准备回测数据"""
-        # 预测数据
-        preds_all = ensure_inst_dt(pd.read_parquet(Path(self.args["preds"]).expanduser().resolve()))
-        mask = (preds_all["datetime"] >= pd.Timestamp(self.args["start"])) & (preds_all["datetime"] <= pd.Timestamp(self.args["end"]))
-        preds_all = preds_all.loc[mask].copy()
-        if preds_all.empty:
-            raise RuntimeError("预测为空。")
-        pred_days = pd.DatetimeIndex(preds_all["datetime"].unique()).sort_values()
-
-        # 初始 universe：窗口内出现过的所有票 + 锚
-        anchor_sym = self.args["anchor_symbol"].upper() if self.args.get("anchor_symbol") else None
-        universe_all = set(preds_all["instrument"].astype(str).str.upper().unique().tolist())
-        if anchor_sym:
-            universe_all.add(anchor_sym)
-
-        # 行情（锚在第一位）
-        price_map = load_qlib_ohlcv(sorted(list(universe_all)), start=self.args["start"], end=self.args["end"], qlib_dir=self.args["qlib_dir"])
-        if anchor_sym and anchor_sym in price_map:
-            anchor_days = pd.DatetimeIndex(price_map[anchor_sym].index)
-            anchor_first = {anchor_sym: price_map.pop(anchor_sym)}
-            price_map = {**anchor_first, **price_map}
-        else:
-            anchor_days = pd.DatetimeIndex(next(iter(price_map.values())).index)
-
-        # 周频锚定 -> 源预测日 as-of 映射 -> exec_lag 推进到"执行日"
-        sched_anchor = weekly_schedule(anchor_days)
-        sched2pred = asof_map_schedule_to_pred(sched_anchor, pred_days)
-        if not sched2pred:
-            raise RuntimeError("调仓日与预测日无法 as-of 映射（窗口内没有预测）")
-        exec_dates = []
-        anchor_list = sorted(pd.DatetimeIndex(anchor_days).tolist())
-        pos_map = {d: i for i, d in enumerate(anchor_list)}
-        for sd in sched2pred.keys():
-            i = pos_map.get(sd)
-            if i is None:
-                continue
-            j = i + max(0, int(self.args["exec_lag"]))
-            if j < len(anchor_list):
-                exec_dates.append(anchor_list[j])
-        exec_dates = sorted(pd.DatetimeIndex(exec_dates).unique().tolist())
-        if not exec_dates:
-            raise RuntimeError("exec_dates 为空（检查 exec_lag 与日期范围）")
-
-        # 聚合预测：源日 -> 截面
-        preds_all = preds_all.copy()
-        keep_cols = ["instrument","score"] + (["rank"] if "rank" in preds_all.columns else [])
-        preds_all["dt_norm"] = preds_all["datetime"].dt.normalize()
-        preds_by_src = {d: g[keep_cols].copy() for d, g in preds_all.groupby("dt_norm")}
-
-        # exec 日 -> 源预测日
-        exec2pred_src = {}
-        for sd, ps in sched2pred.items():
-            i = pos_map.get(sd)
-            if i is None: continue
-            j = i + max(0, int(self.args["exec_lag"]))
-            if j < len(anchor_list):
-                exec2pred_src[anchor_list[j]] = ps
-
-        # 最终 universe：参加过映射的票
-        mapped_src_days = sorted(set(exec2pred_src.values()))
-        final_universe = set(preds_all[preds_all["dt_norm"].isin(mapped_src_days)]["instrument"].astype(str).str.upper().unique().tolist())
-        if anchor_sym:
-            final_universe.add(anchor_sym)
-        price_map = {sym: df for sym, df in price_map.items() if sym in final_universe}
-
-        # exec->pred 截面（仅保留有行情的票）
-        preds_by_exec = {}
-        for ed, src in exec2pred_src.items():
-            g = preds_by_src.get(src)
-            if g is None: continue
-            g2 = g[g["instrument"].isin(price_map.keys())].copy()
-            preds_by_exec[pd.Timestamp(ed).normalize()] = g2
-
-        # 中性化暴露、波动/ADV
-        neutral_list = [s.strip().lower() for s in self.args["neutralize"].split(",") if s.strip()]
-        expos_map = build_exposures_map(self.args["features_path"], universe=set(price_map.keys()),
-                                        dates=list(preds_by_exec.keys()), use_items=neutral_list)
-        vol_map, adv_map = compute_vol_adv_maps(self.args["features_path"], universe=set(price_map.keys()),
-                                                dates=list(preds_by_exec.keys()), halflife=int(self.args["ewm_halflife"]))
-
-        # 短腿择时日期集合
-        short_allow_dates: Set[pd.Timestamp] = set()
-        if self.args.get("short_timing_mom63") and anchor_sym and anchor_sym in price_map:
-            short_allow_dates = _compute_short_timing_dates(
-                price_map[anchor_sym],
-                exec_dates=list(preds_by_exec.keys()),
-                lookback=int(self.args["short_timing_lookback"]),
-                thr=float(self.args["short_timing_threshold"])
-            )
-
-        return {
-            "price_map": price_map,
-            "preds_by_exec": preds_by_exec,
-            "exec_dates": list(preds_by_exec.keys()),
-            "expos_map": expos_map,
-            "vol_map": vol_map,
-            "adv_map": adv_map,
-            "short_allow_dates": short_allow_dates,
-            "neutral_list": neutral_list,
-        }
+        """准备回测数据 - 委托给策略特定的数据准备方法"""
+        from strategies.base.strategy_registry import StrategyFactory
+        
+        # 从配置中获取策略配置
+        strategy_config = self.config.get("strategy", {"name": "xsec_rebalance"})
+        
+        # 使用工厂获取策略类
+        strategy_class = StrategyFactory.create_strategy(strategy_config)
+        
+        # 直接调用策略类的prepare_data方法（静态方法调用）
+        # Backtrader策略类不能直接实例化，需要由Cerebro实例化
+        data = strategy_class.prepare_data(self.config)
+        
+        return data
 
     def run_backtest(self, data: Dict[str, Any]) -> Any:
         """运行回测"""
