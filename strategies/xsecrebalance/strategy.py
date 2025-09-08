@@ -514,7 +514,7 @@ class XSecRebalance(bt.Strategy):
     @classmethod
     def prepare_data(cls, config: Dict[str, Any]) -> Dict[str, Any]:
         """XSecRebalance 策略的数据准备"""
-        from backtest.engine.data_utils import (
+        from strategies.xsecrebalance.data_preparation import (
             prepare_predictions, prepare_price_data, prepare_execution_dates,
             prepare_exposures, prepare_vol_adv, prepare_short_timing,
             get_universe_from_predictions, filter_universe_by_mapped_predictions
