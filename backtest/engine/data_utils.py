@@ -32,6 +32,9 @@ def prepare_predictions(config: Dict[str, Any]) -> Tuple[Dict[pd.Timestamp, pd.D
     preds_all_copy["dt_norm"] = preds_all_copy["datetime"].dt.normalize()
     preds_by_src = {d: g[keep_cols].copy() for d, g in preds_all_copy.groupby("dt_norm")}
 
+    # ---- 关键修复：下游需要在 preds_all 上使用 dt_norm，这里同步补上一列（最小改动） ----
+    preds_all["dt_norm"] = preds_all["datetime"].dt.normalize()
+
     return preds_by_src, preds_all
 
 
