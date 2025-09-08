@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import pandas as pd
 import numpy as np
 from . import EntryStrategy
-from .icdf_equal_strategy import ICDFEqualStrategy
+from .icdf_equal_strategy import ICDFEqualStrategy, waterfill_two_legs
 
 
 class EntryStrategyCoordinator:
@@ -18,9 +18,18 @@ class EntryStrategyCoordinator:
     def __init__(self,
                  icdf_equal_config: Optional[Dict] = None,
                  enabled_strategies: List[str] = None,
-                 strategy_weights: Optional[Dict[str, float]] = None):
+                 strategy_weights: Optional[Dict[str, float]] = None,
+                 # 组合后归一（可选）
+                 post_normalize: bool = False,
+                 long_exposure: float = 1.0,
+                 short_exposure: float = -1.0,
+                 max_pos_per_name: float = 0.05):
         self.enabled_strategies = enabled_strategies or ["icdf_equal"]
         self.strategy_weights = strategy_weights or {"icdf_equal": 1.0}
+        self.post_normalize = bool(post_normalize)
+        self._long_exposure = float(long_exposure)
+        self._short_exposure = float(short_exposure)
+        self._max_pos = float(max_pos_per_name)
         self.strategies: Dict[str, EntryStrategy] = {}
         
         if "icdf_equal" in self.enabled_strategies:
@@ -86,6 +95,16 @@ class EntryStrategyCoordinator:
         
         # 多个策略：按权重组合结果
         combined_weights = self._combine_strategy_weights(strategy_results)
+
+        # 组合后归一（可选）：确保两腿目标敞口与单名上限
+        if self.post_normalize:
+            combined_weights = waterfill_two_legs(
+                combined_weights,
+                long_exposure=self._long_exposure,
+                short_exposure=self._short_exposure,
+                max_pos_per_name=self._max_pos,
+                allow_shorts=allow_shorts,
+            )
         
         # 更新状态
         self.prev_weights = combined_weights.copy()

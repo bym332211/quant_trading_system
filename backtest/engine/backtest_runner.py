@@ -11,13 +11,6 @@ import json
 # KPI计算模块
 from backtest.kpi.calculator import KPICalculator
 
-# 数据加载模块
-from backtest.engine.data_loader import (
-    ensure_inst_dt, weekly_schedule, asof_map_schedule_to_pred,
-    load_qlib_ohlcv, build_exposures_map, compute_vol_adv_maps,
-    _compute_short_timing_dates
-)
-
 
 class BacktestRunner:
     """回测执行器"""
@@ -95,7 +88,7 @@ class BacktestRunner:
             hard_cap=bool(self.config["entry"]["hard_cap"]),
             verbose=bool(self.args["verbose"]),
             # 入场策略配置
-            entry_strategies_config = self.config["entry"],
+            entry_strategies_config=self.config["entry"],
             # 出场策略配置
             exit_strategies_config=self.config["exit"],
         )
@@ -118,8 +111,10 @@ class BacktestRunner:
         # 导出逐日收益
         tr = results[0].analyzers.timeret.get_analysis()
         if tr:
-            retdf = pd.DataFrame({"datetime": list(tr.keys()), "ret": list(tr.values())})
-            retdf["datetime"] = pd.to_datetime(retdf["datetime"]).sort_values()
+            retdf = pd.DataFrame({
+                "datetime": pd.to_datetime(list(tr.keys())),
+                "ret": list(tr.values()),
+            }).sort_values("datetime")
         else:
             retdf = eq[["datetime","ret"]].copy()
         retdf.to_csv(out_dir / "portfolio_returns.csv", index=False)

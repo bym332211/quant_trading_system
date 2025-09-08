@@ -117,43 +117,32 @@ class BaseStrategy(ABC):
 
 
 class StrategyFactory:
-    """策略工厂 - 根据配置创建策略实例"""
-    
-    _strategies: Dict[str, Type[BaseStrategy]] = {}
-    
+    """策略工厂 - 返回可供 Backtrader 使用的"策略类"。
+
+    说明：
+    - 工厂产物是一个 Backtrader `bt.Strategy` 子类，而非 `BaseStrategy` 的实例。
+    - 该类需要提供类方法 `prepare_data(config) -> Dict[str, Any]`，用于在回测前准备数据。
+    """
+
+    # 映射: 策略名 -> Backtrader 策略类
+    _strategies: Dict[str, Type[bt.Strategy]] = {}
+
     @classmethod
-    def create_strategy(cls, strategy_config: Dict[str, Any]) -> Type[BaseStrategy]:
-        """
-        获取策略类
-        
-        Args:
-            strategy_config: 策略配置
-            
-        Returns:
-            策略类
-            
-        Raises:
-            ValueError: 如果策略类型未知
-        """
+    def create_strategy(cls, strategy_config: Dict[str, Any]) -> Type[bt.Strategy]:
+        """按名称获取策略类（Backtrader Strategy 子类）。"""
         strategy_name = strategy_config.get("name", "xsec_rebalance")
-        
+
         if strategy_name not in cls._strategies:
             raise ValueError(f"未知策略类型: {strategy_name}")
-        
+
         return cls._strategies[strategy_name]
-    
+
     @classmethod
-    def register_strategy(cls, name: str, strategy_class: Type[BaseStrategy]) -> None:
-        """
-        注册新策略类型
-        
-        Args:
-            name: 策略名称
-            strategy_class: 策略类
-        """
+    def register_strategy(cls, name: str, strategy_class: Type[bt.Strategy]) -> None:
+        """注册新的 Backtrader 策略类。"""
         cls._strategies[name] = strategy_class
-    
+
     @classmethod
     def list_strategies(cls) -> List[str]:
-        """列出所有已注册的策略"""
+        """列出所有已注册的策略名称。"""
         return list(cls._strategies.keys())

@@ -15,7 +15,8 @@ from strategies.entry_strategies import EntryStrategyCoordinator
 from backtest.engine.data_loader import apply_adv_limit
 
 # 策略基类
-from strategies.base.base_strategy import BaseStrategy
+# 注：XSecRebalance 直接继承 Backtrader 的 Strategy；
+# BaseStrategy 仅作为文档化接口存在，工厂返回的是 Backtrader 策略类。
 
 
 class XSecRebalance(bt.Strategy):
@@ -90,19 +91,28 @@ class XSecRebalance(bt.Strategy):
         # 存储入场策略配置（用于后续初始化）
         self._entry_strategies_config = getattr(self.p, "entry_strategies_config", {})
         
-        # 初始化入场策略协调器
-        icdf_equal_config = self._entry_strategies_config.get("icdf_equal", {})
+        # 初始化入场策略协调器（合并顶层 entry 配置 → icdf 配置）
+        icdf_equal_config = self._build_icdf_config(self._entry_strategies_config)
         enabled_strategies = self._entry_strategies_config.get("enabled_strategies", ["icdf_equal"])
         strategy_weights = self._entry_strategies_config.get("strategy_weights", {"icdf_equal": 1.0})
-        
+
         self.entry = EntryStrategyCoordinator(
             icdf_equal_config=icdf_equal_config,
             enabled_strategies=enabled_strategies,
-            strategy_weights=strategy_weights
+            strategy_weights=strategy_weights,
+            # 组合后进行两腿归一与上限控制（使用顶层 entry 配置）
+            post_normalize=True,
+            long_exposure=float(self.p.long_exposure),
+            short_exposure=float(self.p.short_exposure),
+            max_pos_per_name=float(self.p.max_pos_per_name),
         )
         
         # 存储出场策略配置（用于后续初始化）
         self._exit_strategies_config = getattr(self.p, "exit_strategies_config", {})
+
+        # 历史数据缓存与动态窗口
+        self._hist_cache: dict[str, pd.DataFrame] = {}
+        self._exit_lookback = self._compute_exit_lookback(self._exit_strategies_config)
 
     # ----- Backtrader callbacks -----
     def notify_order(self, order):
@@ -186,6 +196,9 @@ class XSecRebalance(bt.Strategy):
                 enabled_strategies=enabled_strategies
             )
         
+        # 先增量更新历史缓存（所有数据源），避免每次重建 DataFrame
+        self._update_all_hist_cache(dtoday)
+
         # 检查每个持仓是否需要出场
         exit_symbols = []
         for d in self.datas:
@@ -194,16 +207,9 @@ class XSecRebalance(bt.Strategy):
                 symbol = d._name
                 current_price = float(d.close[0])
                 
-                # 获取历史价格数据（最近60天）
-                lookback = 60
-                if len(d) >= lookback:
-                    historical_data = pd.DataFrame({
-                        'open': [float(d.open[i]) for i in range(-lookback, 0)],
-                        'high': [float(d.high[i]) for i in range(-lookback, 0)],
-                        'low': [float(d.low[i]) for i in range(-lookback, 0)],
-                        'close': [float(d.close[i]) for i in range(-lookback, 0)],
-                        'volume': [float(d.volume[i]) for i in range(-lookback, 0)]
-                    }, index=pd.date_range(end=dtoday, periods=lookback, freq='D'))
+                # 使用缓存的历史窗口；若样本不足则跳过出场判断
+                historical_data = self._hist_cache.get(symbol)
+                if historical_data is not None and len(historical_data) >= self._exit_lookback:
                     
                     # 记录入场信息（如果尚未记录）
                     if symbol not in self.exit_coordinator.entry_prices:
@@ -337,7 +343,8 @@ class XSecRebalance(bt.Strategy):
         # 同步 prev_weights（以 ADV 限速后的最终权重为准）
         self.prev_weights = tgt.copy()
         self.entry.prev_weights = tgt.copy()
-        self.reb_counter += 1
+        # 与 EntryStrategyCoordinator 的计数对齐：只在协调器侧自增
+        self.reb_counter = self.entry.reb_counter
 
     # ----- BaseStrategy 接口实现 -----
     
@@ -399,19 +406,26 @@ class XSecRebalance(bt.Strategy):
         # 存储入场策略配置
         self._entry_strategies_config = config.get("entry", {})
         
-        # 重新初始化入场策略协调器
-        icdf_equal_config = self._entry_strategies_config.get("icdf_equal", {})
+        # 重新初始化入场策略协调器（配置可能变化）
+        icdf_equal_config = self._build_icdf_config(self._entry_strategies_config)
         enabled_strategies = self._entry_strategies_config.get("enabled_strategies", ["icdf_equal"])
         strategy_weights = self._entry_strategies_config.get("strategy_weights", {"icdf_equal": 1.0})
-        
+
         self.entry = EntryStrategyCoordinator(
             icdf_equal_config=icdf_equal_config,
             enabled_strategies=enabled_strategies,
-            strategy_weights=strategy_weights
+            strategy_weights=strategy_weights,
+            post_normalize=True,
+            long_exposure=float(self.p.long_exposure),
+            short_exposure=float(self.p.short_exposure),
+            max_pos_per_name=float(self.p.max_pos_per_name),
         )
         
-        # 存储出场策略配置
+        # 存储出场策略配置并更新动态窗口
         self._exit_strategies_config = getattr(self.p, "exit_strategies_config", {})
+        self._exit_lookback = self._compute_exit_lookback(self._exit_strategies_config)
+        # 重置历史缓存（配置变化时）
+        self._hist_cache = {}
     
     def entry_strategy(self, dtoday: pd.Timestamp, preds_df: pd.DataFrame, 
                       prev_weights: Dict[str, float]) -> Dict[str, float]:
@@ -422,7 +436,7 @@ class XSecRebalance(bt.Strategy):
         
         allow_shorts_today = (not self.p.short_timing_on) or (dtoday in self._short_allow)
         
-        return self.entry.generate_entry_weights(
+        result = self.entry.generate_entry_weights(
             g=g,
             prev_weights=prev_weights or {},
             expos_df=self._expos.get(dtoday),
@@ -430,6 +444,9 @@ class XSecRebalance(bt.Strategy):
             allow_shorts=allow_shorts_today,
             reb_counter=int(self.reb_counter),
         )
+        # 同步本地计数，避免双重自增
+        self.reb_counter = self.entry.reb_counter
+        return result
     
     def exit_strategy(self, dtoday: pd.Timestamp) -> List[Tuple[str, List[str]]]:
         """出场策略：检查是否需要出场"""
@@ -507,7 +524,7 @@ class XSecRebalance(bt.Strategy):
         """获取诊断信息"""
         return {
             "commission_cum": self._commission_cum,
-            "reb_counter": self.reb_counter,
+            "reb_counter": self.entry.reb_counter,
             "exit_stats": getattr(self.exit_coordinator, 'get_stats', lambda: {})()
         }
     
@@ -582,3 +599,69 @@ class XSecRebalance(bt.Strategy):
         for strategy in self.entry.strategies.values():
             if hasattr(strategy, 'prev_weights'):
                 strategy.prev_weights = new_weights.copy()
+
+    def _build_icdf_config(self, entry_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """合并顶层 entry 配置到 icdf_equal 子配置，确保参数一致性。"""
+        sub = (entry_cfg or {}).get("icdf_equal", {}) or {}
+        base = entry_cfg or {}
+        # 仅挑选 ICDF 支持的键进行合并（子配置优先）
+        keys = [
+            "neutralize_items", "ridge_lambda", "top_k", "short_k",
+            "membership_buffer", "selection_use_rank_mode", "long_exposure",
+            "short_exposure", "max_pos_per_name", "weight_scheme", "smooth_eta",
+            "target_vol", "leverage_cap", "hard_cap", "verbose",
+        ]
+        merged = {k: base[k] for k in keys if k in base}
+        merged.update(sub)
+        return merged
+
+    # ----- helpers -----
+    def _compute_exit_lookback(self, exit_cfg: Dict[str, Any]) -> int:
+        """根据启用的出场策略，动态确定所需历史窗口长度。"""
+        tech = (exit_cfg or {}).get("tech_stop_loss", {})
+        vol  = (exit_cfg or {}).get("volatility_exit", {})
+
+        periods = [
+            int(tech.get("atr_period", 14)),
+            int(tech.get("ma_stop_period", 20)),
+            int(tech.get("bollinger_period", 20)),
+            int(tech.get("rsi_period", 14)),
+            int(vol.get("vol_period", 20)),
+            int(vol.get("market_vol_period", 63)),
+        ]
+        # 至少留足 60 根，避免初期频繁不足
+        return max(periods + [60])
+
+    def _update_all_hist_cache(self, dtoday: pd.Timestamp) -> None:
+        """增量更新所有数据源的历史窗口缓存。"""
+        lookback = self._exit_lookback
+        for d in self.datas:
+            sym = d._name
+            # 若数据长度不足则跳过
+            if len(d) < 1:
+                continue
+            # 读取当前bar
+            rec = {
+                'open': float(d.open[0]),
+                'high': float(d.high[0]),
+                'low': float(d.low[0]),
+                'close': float(d.close[0]),
+                'volume': float(d.volume[0]) if not np.isnan(float(d.volume[0])) else 0.0,
+            }
+            # 使用真实交易日索引
+            idx = pd.Timestamp(bt.num2date(d.datetime[0]).date())
+            prev = self._hist_cache.get(sym)
+            if prev is None:
+                df = pd.DataFrame([rec], index=[idx])
+            else:
+                # 仅在新bar时追加
+                if idx not in prev.index:
+                    df = pd.concat([prev, pd.DataFrame([rec], index=[idx])])
+                else:
+                    # 回填/覆盖当日（如 close 模式多次 next）
+                    df = prev.copy()
+                    df.loc[idx] = rec
+            # 截断窗口大小
+            if len(df) > lookback:
+                df = df.iloc[-lookback:]
+            self._hist_cache[sym] = df

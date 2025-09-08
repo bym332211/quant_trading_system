@@ -49,7 +49,6 @@ def prepare_price_data(config: Dict[str, Any], universe: Set[str]) -> Dict[str, 
     # 如果有锚定符号，放在第一位
     anchor_sym = args["anchor_symbol"].upper() if args.get("anchor_symbol") else None
     if anchor_sym and anchor_sym in price_map:
-        anchor_days = pd.DatetimeIndex(price_map[anchor_sym].index)
         anchor_first = {anchor_sym: price_map.pop(anchor_sym)}
         price_map = {**anchor_first, **price_map}
     

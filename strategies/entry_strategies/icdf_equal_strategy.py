@@ -23,6 +23,8 @@ def icdf_weights(ranks: np.ndarray) -> np.ndarray:
         s = np.sign(x)
         return s * np.sqrt(np.sqrt((2/(np.pi*a) + ln/2)**2 - ln/a) - (2/(np.pi*a) + ln/2))
     p = (ranks - 0.5) / (len(ranks) + 1.0)
+    # 数值稳健性：避免极端分位导致反误差函数不稳定
+    p = np.clip(p, 1e-6, 1 - 1e-6)
     z = np.sqrt(2.0) * erfinv(2*p - 1)
     return z
 
