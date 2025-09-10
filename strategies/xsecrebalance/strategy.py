@@ -26,6 +26,7 @@ class XSecRebalance(bt.Strategy):
         exposures_by_date=None,
         vol_by_date=None,
         adv_by_date=None,
+        liq_bucket_by_date=None,
         neutralize_items=(),
         ridge_lambda=1e-6,
 
@@ -69,6 +70,7 @@ class XSecRebalance(bt.Strategy):
         self._expos = self.p.exposures_by_date or {}
         self._vol   = self.p.vol_by_date or {}
         self._adv   = self.p.adv_by_date or {}
+        self._liq_buckets = self.p.liq_bucket_by_date or {}
         self._neutral = tuple(self.p.neutralize_items) if self.p.neutralize_items else tuple()
         self._short_allow = set(self.p.short_timing_dates) if self.p.short_timing_dates else set()
 
@@ -113,6 +115,8 @@ class XSecRebalance(bt.Strategy):
         # 历史数据缓存与动态窗口
         self._hist_cache: dict[str, pd.DataFrame] = {}
         self._exit_lookback = self._compute_exit_lookback(self._exit_strategies_config)
+        # 读取过滤配置
+        self._filters_cfg = (self._entry_strategies_config or {}).get("filters", {}) or {}
 
     # ----- Backtrader callbacks -----
     def notify_order(self, order):
@@ -277,11 +281,16 @@ class XSecRebalance(bt.Strategy):
         # 短腿择时：不允许做空则在入场策略中清空 short 候选
         allow_shorts_today = (not self.p.short_timing_on) or (dtoday in self._short_allow)
 
+        # 应用入场过滤（行业×流动性桶）
+        expos_df_today = self._expos.get(dtoday)
+        if g is not None and not g.empty:
+            g = self._apply_entry_filters(dtoday, g, expos_df_today)
+
         # 使用 EntryStrategy 生成"ADV 限速之前"的目标权重
         tgt_pre_adv = self.entry.generate_entry_weights(
             g=g,
             prev_weights=self.prev_weights or {},
-            expos_df=self._expos.get(dtoday),
+            expos_df=expos_df_today,
             vol_df=self._vol.get(dtoday),
             allow_shorts=allow_shorts_today,
             reb_counter=int(self.reb_counter),
@@ -570,8 +579,8 @@ class XSecRebalance(bt.Strategy):
         # 8. 准备暴露数据
         expos_map = prepare_exposures(config, final_universe, set(preds_by_exec.keys()))
         
-        # 9. 准备波动率和ADV数据
-        vol_map, adv_map = prepare_vol_adv(config, final_universe, set(preds_by_exec.keys()))
+        # 9. 准备波动率和ADV数据 + 流动性桶
+        vol_map, adv_map, liq_map = prepare_vol_adv(config, final_universe, set(preds_by_exec.keys()))
         
         # 10. 准备短腿择时数据
         short_allow_dates = prepare_short_timing(config, price_map, set(preds_by_exec.keys()))
@@ -586,6 +595,7 @@ class XSecRebalance(bt.Strategy):
             "expos_map": expos_map,
             "vol_map": vol_map,
             "adv_map": adv_map,
+            "liq_bucket_by_date": liq_map,
             "short_allow_dates": short_allow_dates,
             "neutral_list": neutral_list,
         }
@@ -605,6 +615,7 @@ class XSecRebalance(bt.Strategy):
         sub = (entry_cfg or {}).get("icdf_equal", {}) or {}
         base = entry_cfg or {}
         # 仅挑选 ICDF 支持的键进行合并（子配置优先）
+        # 注意：filters 属于上层配置，不能传入子策略构造函数
         keys = [
             "neutralize_items", "ridge_lambda", "top_k", "short_k",
             "membership_buffer", "selection_use_rank_mode", "long_exposure",
@@ -614,6 +625,68 @@ class XSecRebalance(bt.Strategy):
         merged = {k: base[k] for k in keys if k in base}
         merged.update(sub)
         return merged
+
+    def _apply_entry_filters(self, dtoday: pd.Timestamp, g: pd.DataFrame, expos_df: pd.DataFrame | None) -> pd.DataFrame:
+        """按配置过滤不入场的标的：行业×流动性桶。
+
+        配置示例（config.entry.filters.sector_liq_exclude）：
+          filters:
+            sector_liq_exclude:
+              Technology: [4, 3]
+              Energy: [3]
+        """
+        rules = (self._filters_cfg or {}).get("sector_liq_exclude", {}) or {}
+        if not isinstance(rules, dict) or g is None or g.empty:
+            return g
+
+        # instrument -> sector (from ind_* one-hot in exposures)
+        inst2sector: dict[str, str] = {}
+        if expos_df is not None and not expos_df.empty:
+            sector_cols = [c for c in expos_df.columns if isinstance(c, str) and c.startswith("ind_")]
+            if sector_cols:
+                edf = expos_df[["instrument"] + sector_cols].copy()
+                for _, row in edf.iterrows():
+                    inst = str(row["instrument"]).upper()
+                    sec = None
+                    for c in sector_cols:
+                        try:
+                            if float(row.get(c, 0.0)) > 0.5:
+                                sec = c[4:]
+                                break
+                        except Exception:
+                            continue
+                    if sec:
+                        inst2sector[inst] = sec
+
+        # instrument -> liq_bucket (from precomputed map)
+        inst2lb: dict[str, int] = {}
+        liq_df = self._liq_buckets.get(dtoday)
+        if liq_df is not None and not liq_df.empty and {"instrument","liq_bucket"} <= set(liq_df.columns):
+            for _, r in liq_df.iterrows():
+                try:
+                    inst2lb[str(r["instrument"]).upper()] = int(r["liq_bucket"])
+                except Exception:
+                    continue
+
+        def is_filtered(inst: str) -> bool:
+            sec = inst2sector.get(inst)
+            lb = inst2lb.get(inst)
+            if sec is None or lb is None:
+                return False
+            buckets = rules.get(sec)
+            if buckets is None:
+                return False
+            if isinstance(buckets, dict):
+                buckets = [k for k, v in buckets.items() if v]
+            try:
+                return int(lb) in set(int(x) for x in buckets)
+            except Exception:
+                return False
+
+        g2 = g.copy()
+        g2["instrument"] = g2["instrument"].astype(str).str.upper()
+        mask = g2["instrument"].map(lambda x: not is_filtered(x))
+        return g2.loc[mask].reset_index(drop=True)
 
     # ----- helpers -----
     def _compute_exit_lookback(self, exit_cfg: Dict[str, Any]) -> int:

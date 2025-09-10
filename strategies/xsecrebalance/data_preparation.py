@@ -111,13 +111,13 @@ def prepare_exposures(config: Dict[str, Any], universe: Set[str], exec_dates: Se
     return expos_map
 
 
-def prepare_vol_adv(config: Dict[str, Any], universe: Set[str], exec_dates: Set[pd.Timestamp]) -> Tuple[Dict[pd.Timestamp, pd.DataFrame], Dict[pd.Timestamp, pd.DataFrame]]:
+def prepare_vol_adv(config: Dict[str, Any], universe: Set[str], exec_dates: Set[pd.Timestamp]) -> Tuple[Dict[pd.Timestamp, pd.DataFrame], Dict[pd.Timestamp, pd.DataFrame], Dict[pd.Timestamp, pd.DataFrame]]:
     """准备波动率和ADV数据 - XSecRebalance特有"""
     args = config["args"]
     
-    vol_map, adv_map = compute_vol_adv_maps(args["features_path"], universe=universe,
-                                            dates=list(exec_dates), halflife=int(args["ewm_halflife"]))
-    return vol_map, adv_map
+    vol_map, adv_map, liq_map = compute_vol_adv_maps(args["features_path"], universe=universe,
+                                                     dates=list(exec_dates), halflife=int(args["ewm_halflife"]))
+    return vol_map, adv_map, liq_map
 
 
 def prepare_short_timing(config: Dict[str, Any], price_map: Dict[str, pd.DataFrame], exec_dates: Set[pd.Timestamp]) -> Set[pd.Timestamp]:

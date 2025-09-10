@@ -118,6 +118,38 @@ icdf 更强调头部、对尾部分配更克制；equal 更分散，换手较低
 - 结果“看起来不错”是否因含样本期？
 若 --preds 覆盖 2020–2024 的训练内预测，确实会乐观。务必只用 OOS 预测做回测；推荐 Walk-Forward。
 
+## 层级网格搜索（Sharpe）
+
+- 目标：先用粗粒度网格快速探索方向，再在最优点附近细化，最大化 Sharpe。
+- 提供两个脚本：
+  - `scripts/sweep_sharpe_focus.py`：单阶段扫参数（`coarse|medium|focused|fine`）。
+  - `scripts/hierarchical_sweep_sharpe.py`：两阶段（粗 → 细化）自动围绕最优点构建邻域。
+
+示例（两阶段 + 邻域扩展）：
+
+```
+python scripts/hierarchical_sweep_sharpe.py \
+  --qlib_dir "/home/ec2-user/.qlib/qlib_data/us_data" \
+  --preds "artifacts/preds/weekly/predictions.parquet" \
+  --features_path "artifacts/features_day.parquet" \
+  --start "2017-01-01" --end "2024-12-31" \
+  --out_root "backtest/reports/hier_sweep" \
+  --stage1_preset coarse --run_stage2 \
+  --try_both_weight_schemes --try_alt_neutralize
+```
+
+细化阶段可通过以下参数调节邻域大小：
+- `--n_topk_neighbors`/`--step_topk`（`top_k` 左右邻点与步长）
+- `--n_tv_neighbors`/`--step_tv`（`target_vol`）
+- `--n_buf_neighbors`/`--step_buf`（`membership_buffer`）
+- `--n_eta_neighbors`/`--step_eta`（`smooth_eta`）
+- `--n_cap_neighbors`/`--step_cap`（`max_pos_per_name`）
+
+输出（目录：`backtest/reports/hier_sweep/<timestamp>/`）：
+- `s1_summary.csv`、`best_params_s1.json`（阶段1）
+- `s2_summary.csv`、`best_params_s2.json`（阶段2，如启用）
+- `BEST` 文件指向最终最优 run 目录
+
 ## 任务看板（简版）
 
 - P0：端到端闭环 + 周频 LGBM 基线 + 报告 ✅（回测+诊断已就绪，训练/预测脚本 WIP）

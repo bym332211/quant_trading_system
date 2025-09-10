@@ -101,11 +101,11 @@ class ConfigLoader:
         if args.membership_buffer is not None:
             sel_cfg["membership_buffer"] = float(args.membership_buffer)
 
-        # 获取入场策略配置
+        # 获取入场策略配置（兼容两种键：entry 与 entry_strategies）
         entry_cfg = {}
         if active_strategy_key and active_strategy_key in strategies_cfg:
             strategy_cfg = strategies_cfg[active_strategy_key]
-            entry_cfg = strategy_cfg.get("entry_strategies", {})
+            entry_cfg = strategy_cfg.get("entry", {}) or strategy_cfg.get("entry_strategies", {})
         
         # 获取出场策略配置
         exit_cfg = {}
@@ -124,6 +124,8 @@ class ConfigLoader:
         target_vol = entry_cfg.get("target_vol", 0.0)
         leverage_cap = entry_cfg.get("leverage_cap", 2.0)
         hard_cap = entry_cfg.get("hard_cap", False)
+        # 透传入场过滤规则（例如 sector_liq_exclude），默认空字典
+        filters_cfg = entry_cfg.get("filters", {}) or {}
         
         # CLI参数覆盖
         if args.neutralize:
@@ -147,9 +149,17 @@ class ConfigLoader:
         if args.hard_cap:
             hard_cap = True
 
+        # 选择策略类名称：目前仅注册了 XSecRebalance，将不同 key 视为该策略的不同配置预设
+        strategy_class_name = "xsec_rebalance"
+        if active_strategy_key and active_strategy_key in strategies_cfg:
+            # 如未来在 YAML 中提供了明确的类名，可优先使用
+            strategy_cfg = strategies_cfg[active_strategy_key]
+            if isinstance(strategy_cfg, dict) and "class_name" in strategy_cfg:
+                strategy_class_name = str(strategy_cfg.get("class_name") or "xsec_rebalance").strip()
+
         # 构建策略配置
         strategy_config = {
-            "name": active_strategy_key or "xsec_rebalance",
+            "name": strategy_class_name,
             "selection": {
                 "top_k": int(sel_cfg.get("top_k", 50)),
                 "short_k": int(sel_cfg.get("short_k", 50)),
@@ -167,8 +177,12 @@ class ConfigLoader:
                 "target_vol": target_vol,
                 "leverage_cap": leverage_cap,
                 "hard_cap": hard_cap,
+                # 需要传递给策略，用于 _apply_entry_filters
+                "filters": filters_cfg,
             },
             "exit": exit_cfg,
+            # 记录激活的策略预设 key（便于输出/诊断）
+            "preset_key": active_strategy_key,
         }
 
         return {

@@ -99,14 +99,14 @@ def build_exposures_map(features_path: str, universe: Set[str], dates: List[pd.T
 
 
 def compute_vol_adv_maps(features_path: str, universe: Set[str], dates: List[pd.Timestamp],
-                        halflife: int = 20) -> Tuple[Dict[pd.Timestamp, pd.DataFrame], Dict[pd.Timestamp, pd.DataFrame]]:
+                        halflife: int = 20) -> Tuple[Dict[pd.Timestamp, pd.DataFrame], Dict[pd.Timestamp, pd.DataFrame], Dict[pd.Timestamp, pd.DataFrame]]:
     """
     计算波动率和ADV映射
     返回:
       vol_map[date]: DataFrame[instrument, sigma]  (日波动率, EWM std, 以 date-1 为止)
       adv_map[date]: DataFrame[instrument, adv_dollar] (≈ ADV20 * vwap, 以 date-1 为止)
     """
-    need = ["instrument","datetime","ret_1","adv_20","$vwap"]
+    need = ["instrument","datetime","ret_1","adv_20","$vwap","ln_dollar_vol_20"]
     df = pd.read_parquet(Path(features_path).expanduser().resolve(), columns=None)
     # 稳健性增强 #1：缺列时降级
     exist = set(df.columns)
@@ -139,7 +139,26 @@ def compute_vol_adv_maps(features_path: str, universe: Set[str], dates: List[pd.
         adv_map = {pd.Timestamp(d).normalize(): g[["instrument","adv_dollar"]].dropna().reset_index(drop=True)
                    for d, g in df.groupby("datetime") if pd.Timestamp(d).normalize() in set(dates)}
 
-    return vol_map, adv_map
+    # Liquidity buckets by day (0..4) based on ln_dollar_vol_20 cross-sectional quintiles
+    liq_map: Dict[pd.Timestamp, pd.DataFrame] = {}
+    if "ln_dollar_vol_20" in df.columns and not df.empty:
+        for d, g in df.groupby("datetime"):
+            dt_norm = pd.Timestamp(d).normalize()
+            if dt_norm not in set(dates):
+                continue
+            s = g[["instrument","ln_dollar_vol_20"]].dropna()
+            if s.empty or len(s) < 10:
+                continue
+            try:
+                q = pd.qcut(s["ln_dollar_vol_20"], q=5, labels=False, duplicates='drop').astype("Int64")
+            except ValueError:
+                q = pd.cut(s["ln_dollar_vol_20"], bins=5, labels=False, duplicates='drop').astype("Int64")
+            liq_map[dt_norm] = pd.DataFrame({
+                "instrument": s["instrument"].astype(str).str.upper().values,
+                "liq_bucket": q.values,
+            })
+
+    return vol_map, adv_map, liq_map
 
 
 def apply_adv_limit(prev_w: Dict[str, float], tgt_w: Dict[str, float],

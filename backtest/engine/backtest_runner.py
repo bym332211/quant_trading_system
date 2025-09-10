@@ -64,6 +64,7 @@ class BacktestRunner:
             exposures_by_date=data["expos_map"],
             vol_by_date=data["vol_map"],
             adv_by_date=data["adv_map"],
+            liq_bucket_by_date=data.get("liq_bucket_by_date", {}),
             neutralize_items=tuple(data["neutral_list"]),
             ridge_lambda=self.args["ridge_lambda"],
             trade_at=self.args["trade_at"],
