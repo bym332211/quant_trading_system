@@ -213,8 +213,17 @@ strategies:
       # 可按需调整/扩展；示例：过滤 Energy@bucket3、Financial Services@bucket3
       filters:
         sector_liq_exclude:
-          Energy: [3]
-          Financial Services: [3]
+          # 底部4个行业：全桶屏蔽（0..4）
+          Energy: [0, 1, 2, 3, 4]
+          Financial Services: [0, 1, 2, 3, 4]
+          Consumer Defensive: [0, 1, 2, 3, 4]
+          Real Estate: [0, 1, 2, 3, 4]
+          # 其余行业：仅屏蔽净额为负的桶
+          Basic Materials: [0, 1]
+          Communication Services: [4]
+          Consumer Cyclical: [2, 3]
+          Utilities: [1]
+          Technology: [4]
     
     exit:
       tech_stop_loss:
@@ -373,10 +382,17 @@ strategies:
       filters:
         # 保守版：优先屏蔽明显的高亏损组合
         sector_liq_exclude:
-          Energy: [3]
-          Financial Services: [3]
-          Consumer Cyclical: [3]
+          # 底部4个行业：全桶屏蔽（0..4）
+          Energy: [0, 1, 2, 3, 4]
+          Financial Services: [0, 1, 2, 3, 4]
+          Consumer Defensive: [0, 1, 2, 3, 4]
+          Real Estate: [0, 1, 2, 3, 4]
+          # 其余行业：仅屏蔽净额为负的桶
+          Basic Materials: [0, 1]
           Communication Services: [4]
+          Consumer Cyclical: [2, 3]
+          Utilities: [1]
+          Technology: [4]
     exit:
       enabled_strategies: ["tech_stop_loss", "volatility_exit"]
 
@@ -408,13 +424,17 @@ strategies:
       filters:
         # 适中版：在保守基础上增加若干负向贡献明显的组合
         sector_liq_exclude:
-          Energy: [3]
-          Financial Services: [3]
-          Consumer Cyclical: [3]
+          # 底部4个行业：全桶屏蔽（0..4）
+          Energy: [0, 1, 2, 3, 4]
+          Financial Services: [0, 1, 2, 3, 4]
+          Consumer Defensive: [0, 1, 2, 3, 4]
+          Real Estate: [0, 1, 2, 3, 4]
+          # 其余行业：仅屏蔽净额为负的桶
+          Basic Materials: [0, 1]
           Communication Services: [4]
+          Consumer Cyclical: [2, 3]
           Utilities: [1]
-          Healthcare: [3]
-          Real Estate: [3]
+          Technology: [4]
     exit:
       enabled_strategies: ["tech_stop_loss", "volatility_exit"]
 
@@ -446,15 +466,16 @@ strategies:
       filters:
         # 激进版：进一步屏蔽更多高亏损组合（含 Tech@4）
         sector_liq_exclude:
-          Energy: [3]
-          Financial Services: [3]
-          Consumer Cyclical: [3]
+          # 底部4个行业：全桶屏蔽（0..4）
+          Energy: [0, 1, 2, 3, 4]
+          Financial Services: [0, 1, 2, 3, 4]
+          Consumer Defensive: [0, 1, 2, 3, 4]
+          Real Estate: [0, 1, 2, 3, 4]
+          # 其余行业：仅屏蔽净额为负的桶
+          Basic Materials: [0, 1]
           Communication Services: [4]
+          Consumer Cyclical: [2, 3]
           Utilities: [1]
-          Healthcare: [3]
-          Real Estate: [3]
-          Industrials: [3]
-          Basic Materials: [1]
           Technology: [4]
     exit:
       enabled_strategies: ["tech_stop_loss", "volatility_exit"]
