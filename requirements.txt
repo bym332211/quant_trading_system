@@ -1,0 +1,23 @@
+# Core scientific stack
+numpy
+pandas
+pyarrow
+lxml
+
+# Modeling
+lightgbm
+scikit-learn
+joblib
+
+# Data sources & finance
+yfinance
+pyqlib
+backtrader
+
+# Utilities
+requests
+certifi
+PyYAML
+tqdm
+loguru
+fire

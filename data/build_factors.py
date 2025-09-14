@@ -363,12 +363,12 @@ def main():
 
     # 暴露列参数
     ap.add_argument("--beta_window", type=int, default=60, help="mkt_beta_60 的滚动窗口")
-    ap.add_argument("--sector_csv", type=str, default="", help="可选：instrument,sector 映射 CSV")
+    ap.add_argument("--sector_csv", type=str, default="data/instrument_sector.csv", help="instrument,sector 映射 CSV（默认尝试 data/instrument_sector.csv，不存在则自动跳过）")
     ap.add_argument("--shares_csv", type=str, default="", help="可选：instrument,date,shares 股本 CSV（优先）")
     ap.add_argument("--use_yf_shares", action="store_true", help="若无 shares_csv，则用 yfinance 抓历史股本")
     ap.add_argument("--yf_sleep", type=float, default=0.6, help="yfinance 抓取间隔秒数")
     ap.add_argument("--size_buckets", type=int, default=0, help="按 ln_mktcap 做 size 桶 one-hot（如 5）")
-    ap.add_argument("--liq_buckets", type=int, default=0, help="按 ln_dollar_vol_20 做流动性桶 one-hot（如 5）")
+    ap.add_argument("--liq_buckets", type=int, default=5, help="按 ln_dollar_vol_20 做流动性桶 one-hot（默认 5）")
 
     # winsor 设置
     ap.add_argument("--winsor", type=float, default=0.01, help="winsorize 百分位（每边）；0 关闭")
@@ -385,7 +385,16 @@ def main():
     inst_file = Path(qlib_dir) / "instruments" / "all.txt"
     if not inst_file.exists():
         raise FileNotFoundError(f"未找到 {inst_file}")
-    symbols = [l.strip() for l in inst_file.read_text().splitlines() if l.strip()]
+    # instruments/all.txt format: CODE[TAB]start[TAB]end; only take CODE
+    rows = [l.strip() for l in inst_file.read_text().splitlines() if l.strip()]
+    symbols = []
+    for r in rows:
+        code = r.split("\t")[0].strip()
+        if code:
+            symbols.append(code)
+    # de-duplicate while preserving order
+    seen = set()
+    symbols = [s for s in symbols if not (s in seen or seen.add(s))]
     if args.sample and args.sample > 0:
         symbols = symbols[:args.sample]
 

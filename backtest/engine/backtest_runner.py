@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Set
 import pandas as pd
 import backtrader as bt
 import json
+import numpy as np
 
 # KPI计算模块
 from backtest.kpi.calculator import KPICalculator
@@ -153,3 +154,172 @@ class BacktestRunner:
         KPICalculator.save_kpis_to_files(out_dir, summary, kpis)
         print("[summary]", json.dumps(summary, indent=2))
         print(f"[saved] -> {out_dir}")
+
+        # === 新增：行业 & 流动性桶 P&L 归一化报告（[-1,1]，保留2位小数） ===
+        try:
+            pos_path = out_dir / "positions.csv"
+            if pos_path.exists():
+                df_pos = pd.read_csv(pos_path, parse_dates=["datetime"])  # columns: datetime,instrument,size,price,value
+                if not df_pos.empty:
+                    # 准备价格与收益
+                    close_map = {}
+                    for sym, dfp in data["price_map"].items():
+                        s = dfp[["close"]].copy()
+                        s.index = pd.to_datetime(s.index)
+                        close_map[str(sym).upper()] = s.sort_index()
+
+                    # 分组容器
+                    sector_pnl = {}
+                    liq_pnl = {}
+                    sector_liq_pnl = {}
+
+                    expos_map = data.get("expos_map", {}) or {}
+                    liq_map = data.get("liq_bucket_by_date", {}) or {}
+
+                    # 兜底行业映射（若当日 exposures 中无 ind_*）
+                    sector_fallback = {}
+                    try:
+                        sec_csv = Path("data/instrument_sector.csv")
+                        if sec_csv.exists():
+                            sdf = pd.read_csv(sec_csv)
+                            if {"instrument", "sector"} <= set(sdf.columns):
+                                sdf["instrument"] = sdf["instrument"].astype(str).str.upper()
+                                sector_fallback = dict(zip(sdf["instrument"], sdf["sector"].astype(str)))
+                    except Exception:
+                        pass
+
+                    for dt, g in df_pos.groupby("datetime"):
+                        dt = pd.Timestamp(dt).normalize()
+                        # 权重（按绝对持仓归一化，适配可能的多空）
+                        vals = g[["instrument", "value"]].copy()
+                        vals["instrument"] = vals["instrument"].astype(str).str.upper()
+                        denom = float(np.abs(vals["value"]).sum())
+                        if denom <= 0:
+                            continue
+                        vals["w"] = vals["value"] / denom
+
+                        # 次一交易日收益
+                        contrib = []
+                        for _, row in vals.iterrows():
+                            sym = row["instrument"]
+                            w = float(row["w"])
+                            cs = close_map.get(sym)
+                            if cs is None or cs.empty:
+                                continue
+                            idx = cs.index.searchsorted(dt, side="left")
+                            if idx < 0 or idx + 1 >= len(cs.index):
+                                continue
+                            d0 = cs.index[idx]
+                            if d0 != dt:
+                                # 若当日不在价格索引中，尝试找下一个可用交易日
+                                if idx >= len(cs.index) or idx + 1 >= len(cs.index):
+                                    continue
+                                d0 = cs.index[idx]
+                            # 次日
+                            d1 = cs.index.searchsorted(d0, side="right")
+                            if isinstance(d1, np.ndarray):
+                                d1 = int(d1)
+                            if d1 >= len(cs.index):
+                                continue
+                            p0 = float(cs.iloc[idx]["close"])
+                            p1 = float(cs.iloc[d1]["close"])
+                            if not np.isfinite(p0) or p0 == 0:
+                                continue
+                            r = (p1 / p0) - 1.0
+                            contrib.append((sym, w * r))
+
+                        if not contrib:
+                            continue
+
+                        # 行业映射（当日）
+                        sec_map = {}
+                        exdf = expos_map.get(dt)
+                        if exdf is not None and not exdf.empty:
+                            exdf = exdf.copy()
+                            exdf["instrument"] = exdf["instrument"].astype(str).str.upper()
+                            ind_cols = [c for c in exdf.columns if str(c).startswith("ind_")]
+                            if ind_cols:
+                                sub = exdf[["instrument"] + ind_cols].copy()
+                                for _, rr in sub.iterrows():
+                                    inst = rr["instrument"]
+                                    if len(ind_cols) == 1:
+                                        sec = ind_cols[0].replace("ind_", "").strip()
+                                    else:
+                                        vals_np = rr[ind_cols].astype(float).to_numpy()
+                                        j = int(np.nanargmax(vals_np)) if len(vals_np) else 0
+                                        sec = ind_cols[j].replace("ind_", "").strip()
+                                    sec_map[inst] = sec or "Unknown"
+                        # 若仍无行业，使用兜底 CSV
+                        if not sec_map and sector_fallback:
+                            sec_map = sector_fallback.copy()
+
+                        # 流动性桶映射（当日）
+                        lb_map = {}
+                        ldf = liq_map.get(dt)
+                        if ldf is not None and not ldf.empty and "liq_bucket" in ldf.columns:
+                            ldf = ldf.copy()
+                            ldf["instrument"] = ldf["instrument"].astype(str).str.upper()
+                            lb_map = dict(zip(ldf["instrument"], ldf["liq_bucket"]))
+
+                        # 聚合贡献
+                        for sym, c in contrib:
+                            sec = sec_map.get(sym, sector_fallback.get(sym, "Unknown"))
+                            sector_pnl[sec] = sector_pnl.get(sec, 0.0) + float(c)
+                            lb = lb_map.get(sym, None)
+                            # 无法分配桶时，标记为 liq_unknown（与数据准备阶段一致）
+                            lb_key = f"liq_{int(lb)}" if lb is not None and pd.notna(lb) else "liq_unknown"
+                            liq_pnl[lb_key] = liq_pnl.get(lb_key, 0.0) + float(c)
+                            # joint
+                            sector_liq_pnl.setdefault(sec, {})
+                            sector_liq_pnl[sec][lb_key] = sector_liq_pnl[sec].get(lb_key, 0.0) + float(c)
+
+                    def _normalize_round(d: dict) -> dict:
+                        if not d:
+                            return {}
+                        m = max((abs(v) for v in d.values()), default=0.0)
+                        if m <= 0:
+                            return {k: 0.00 for k in d}
+                        out = {k: float(np.clip(v / m, -1.0, 1.0)) for k, v in d.items()}
+                        # 两位小数
+                        return {k: float(f"{v:.2f}") for k, v in out.items()}
+
+                    # 若仅需行业×流动性矩阵，可跳过单独的行业与流动性聚合输出
+                    # joint normalization across all cells
+                    all_vals = [v for dct in sector_liq_pnl.values() for v in dct.values()]
+                    max_abs = max([abs(v) for v in all_vals], default=0.0)
+                    if max_abs <= 0:
+                        joint_norm = {s: {b: 0.00 for b in dct} for s, dct in sector_liq_pnl.items()}
+                    else:
+                        joint_norm = {
+                            s: {b: float(f"{float(np.clip(v / max_abs, -1.0, 1.0)):.2f}") for b, v in dct.items()}
+                            for s, dct in sector_liq_pnl.items()
+                        }
+
+                    # 不再输出 JSON 版本，仅保留 CSV 宽表
+
+                    # 仅输出行业×流动性：长表与宽表 CSV
+                    try:
+                        # joint matrix: 仅输出宽表 CSV（sectors 作为行，liq_buckets 作为列）
+                        if joint_norm:
+                            rows = []
+                            for s, dct in joint_norm.items():
+                                for b, v in dct.items():
+                                    rows.append((s, b, v))
+                            df_long = pd.DataFrame(rows, columns=["sector", "liq_bucket", "value"]) 
+                            if not df_long.empty:
+                                df_wide = df_long.pivot_table(index="sector", columns="liq_bucket", values="value", aggfunc="first")
+                                cols = list(df_wide.columns)
+                                num_cols = [c for c in cols if isinstance(c, str) and c.startswith("liq_") and c.split("_")[-1].isdigit()]
+                                num_cols_sorted = sorted(num_cols, key=lambda x: int(x.split("_")[-1]))
+                                other_cols = [c for c in cols if c not in num_cols]
+                                col_order = num_cols_sorted + [c for c in other_cols if c != "liq_unknown"] + (["liq_unknown"] if "liq_unknown" in other_cols else [])
+                                df_wide = df_wide.reindex(columns=[c for c in col_order if c in df_wide.columns])
+                                df_wide.to_csv(out_dir / "pnl_by_sector_liq_wide.csv", float_format='%.2f')
+                    except Exception:
+                        pass
+        except Exception as e:
+            # 不影响主流程
+            try:
+                print(f"[warn] failed to build group P&L: {e}")
+            except Exception:
+                pass

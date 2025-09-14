@@ -72,7 +72,8 @@ def fetch_from_backups() -> list[str]:
         try:
             resp = requests.get(url, headers=UA, timeout=20, verify=CERT_PATH)
             resp.raise_for_status()
-            df = pd.read_csv(pd.compat.StringIO(resp.text)) if hasattr(pd, "compat") else pd.read_csv(pd.io.common.StringIO(resp.text))
+            # pandas>=2.0 移除了 pd.compat.StringIO；统一使用标准库 io.StringIO
+            df = pd.read_csv(StringIO(resp.text))
             # 常见列名兼容
             col = None
             for c in df.columns:

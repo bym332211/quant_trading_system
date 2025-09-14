@@ -185,10 +185,18 @@ class ConfigLoader:
             "preset_key": active_strategy_key,
         }
 
-        return {
+        merged = {
             "strategy": strategy_config,
             "selection": strategy_config["selection"],
             "entry": strategy_config["entry"],
             "exit": strategy_config["exit"],
             "args": vars(args),
         }
+        # 若 CLI 未提供 --neutralize，但策略配置里提供了 neutralize_items，
+        # 则把其同步到 args.neutralize 以便下游数据准备读取暴露。
+        if (not merged["args"].get("neutralize")) and neutralize_items:
+            merged["args"]["neutralize"] = ",".join(neutralize_items)
+        # 同步 ridge_lambda 到 args，保持一致
+        if merged["args"].get("ridge_lambda") is None and ridge_lambda is not None:
+            merged["args"]["ridge_lambda"] = ridge_lambda
+        return merged

@@ -1,0 +1,36 @@
+strategies:
+  xsec_rebalance:
+    selection:
+      top_k: 10
+      short_k: 0
+      membership_buffer: 0.35
+      use_rank: auto
+    entry:
+      neutralize_items:
+      - beta
+      - sector
+      - size
+      ridge_lambda: 1e-6
+      enabled_strategies:
+      - icdf_equal
+      strategy_weights:
+        icdf_equal: 1.0
+      icdf_equal:
+        neutralize_items:
+        - beta
+        - sector
+        - size
+        ridge_lambda: 1e-6
+        top_k: 50
+        short_k: 0
+        membership_buffer: 0.35
+        selection_use_rank_mode: auto
+        long_exposure: 1.0
+        short_exposure: 0.0
+        max_pos_per_name: 0.04
+        weight_scheme: icdf
+        smooth_eta: 0.65
+        target_vol: 0.11
+        leverage_cap: 1.8
+        hard_cap: true
+      filters: {}
