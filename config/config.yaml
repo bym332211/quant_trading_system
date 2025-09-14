@@ -115,3 +115,55 @@ strategies:
           Real Estate: [0, 1, 4]
           Utilities: [0, 1, 2, 4]
 
+  # # 新增策略：Sharpe 优先的长多预设（参数将被批量网格进一步扫描）
+  # sharpe_focus:
+  #   selection:
+  #     top_k: 50
+  #     short_k: 0
+  #     membership_buffer: 0.35
+  #     use_rank: "auto"
+
+  #   entry:
+  #     # 入场策略协调器配置
+  #     enabled_strategies: ["icdf_equal"]
+  #     strategy_weights:
+  #       icdf_equal: 1.0
+
+  #     # ICDF/等权重策略配置（作为默认起点；批量脚本会用 CLI 覆盖）
+  #     icdf_equal:
+  #       neutralize_items: ["beta", "sector", "size"]
+  #       ridge_lambda: 1e-6
+  #       top_k: 50
+  #       short_k: 0
+  #       membership_buffer: 0.35
+  #       selection_use_rank_mode: "auto"
+  #       long_exposure: 1.0
+  #       short_exposure: 0.0
+  #       max_pos_per_name: 0.04
+  #       weight_scheme: "icdf"
+  #       smooth_eta: 0.65
+  #       target_vol: 0.11
+  #       leverage_cap: 1.8
+  #       hard_cap: true
+
+  #   exit:
+  #     tech_stop_loss:
+  #       atr_multiplier: 2.0
+  #       atr_period: 14
+  #       ma_stop_period: 20
+  #       bollinger_period: 20
+  #       bollinger_std: 2.0
+  #       rsi_period: 14
+  #       rsi_overbought: 70.0
+  #       rsi_oversold: 30.0
+  #       enabled_methods: ["atr", "ma", "bollinger", "rsi"]
+      
+  #     volatility_exit:
+  #       vol_multiplier: 2.0
+  #       vol_period: 20
+  #       market_vol_period: 63
+  #       vol_filter_threshold: 0.3
+  #       max_position_days: 63
+  #       enabled_methods: ["vol_stop", "market_vol", "vol_filter", "time_exit"]
+      
+  #     enabled_strategies: ["tech_stop_loss", "volatility_exit"]
