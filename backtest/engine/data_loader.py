@@ -95,7 +95,9 @@ def build_exposures_map(features_path: str, universe: Set[str], dates: List[pd.T
     out = {}
     for d, g in df.groupby("datetime"):
         out[pd.Timestamp(d).normalize()] = g.reset_index(drop=True)
-    return out
+    
+    # 应用as-of回填，确保所有执行日都有映射数据
+    return _asof_fill_map(out, dates)
 
 
 def compute_vol_adv_maps(features_path: str, universe: Set[str], dates: List[pd.Timestamp],
@@ -158,7 +160,12 @@ def compute_vol_adv_maps(features_path: str, universe: Set[str], dates: List[pd.
                 "liq_bucket": q.values,
             })
 
-    return vol_map, adv_map, liq_map
+    # 对每个映射应用as-of回填，确保所有执行日都有映射数据
+    vol_map_filled = _asof_fill_map(vol_map, dates)
+    adv_map_filled = _asof_fill_map(adv_map, dates)
+    liq_map_filled = _asof_fill_map(liq_map, dates)
+    
+    return vol_map_filled, adv_map_filled, liq_map_filled
 
 
 def apply_adv_limit(prev_w: Dict[str, float], tgt_w: Dict[str, float],
@@ -188,6 +195,43 @@ def apply_adv_limit(prev_w: Dict[str, float], tgt_w: Dict[str, float],
         diag["delta_pre_sum"] += float(abs(delta_pre))
         out[sym] = pw + float(delta)
     return out, diag
+
+
+def _asof_fill_map(target_map: Dict[pd.Timestamp, pd.DataFrame], 
+                  exec_dates: List[pd.Timestamp]) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """
+    对缺失的执行日进行as-of回填
+    
+    参数:
+        target_map: 原始映射字典 {date: DataFrame}
+        exec_dates: 所有需要映射的执行日列表
+        
+    返回:
+        填充后的映射字典，确保所有执行日都有对应的映射数据
+    """
+    if not target_map:
+        return {}
+    
+    # 获取所有有映射数据的日期并排序
+    keys_sorted = pd.DatetimeIndex(sorted(target_map.keys()))
+    if keys_sorted.empty:
+        return {}
+    
+    filled_map = {}
+    
+    for exec_date in exec_dates:
+        exec_date_norm = pd.Timestamp(exec_date).normalize()
+        if exec_date_norm in target_map:
+            filled_map[exec_date_norm] = target_map[exec_date_norm]
+        else:
+            # 找到之前最近的有效日
+            pos = keys_sorted.searchsorted(exec_date_norm, side='right') - 1
+            if pos >= 0:
+                nearest_date = keys_sorted[pos]
+                filled_map[exec_date_norm] = target_map[nearest_date]
+            # 如果没有之前的有效日，则跳过（保持为空）
+    
+    return filled_map
 
 
 def _compute_short_timing_dates(anchor_df: pd.DataFrame,
