@@ -82,7 +82,7 @@ def safe_tag(x) -> str:
 def build_grid_stage1(preset: str) -> List[Dict[str, Any]]:
     """根据预设粒度构建第1阶段粗粒度网格。"""
     if preset == "coarse":
-        top_k_list = [30, 60]
+        top_k_list = [10, 30, 60]
         weight_schemes = ["icdf", "equal"]
         membership_buffers = [0.30]
         max_pos_list = [0.02, 0.04]
