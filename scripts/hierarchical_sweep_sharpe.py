@@ -34,7 +34,7 @@ from typing import Dict, Any, List, Tuple
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config/config.yaml")
-    ap.add_argument("--strategy_key", default="xsec_rebalance")
+    ap.add_argument("--strategy_key", default="sharpe_focus")
     ap.add_argument("--qlib_dir", required=True)
     ap.add_argument("--preds", required=True)
     ap.add_argument("--features_path", required=True)
