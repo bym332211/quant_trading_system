@@ -5,19 +5,55 @@
 
 特性：
 - 第1阶段：使用粗粒度预设快速扫方向；
-- 第2阶段：围绕第1阶段最优参数自动细化局部网格；
-- 输出每阶段 summary CSV、最优参数 JSON，并指向最优 run 目录。
+- 第2阶段：围绕第1阶段最优参数自动细化局部网格（可选）；
+- 输出每阶段 summary CSV、最优参数 JSON，并指向最优 run 目录；
+- 新增：默认支持“多分段（按年）回测 + KPI 汇总（在合并的日收益上计算）”，
+        单周期（start 与 end 同年或 --segmented off）不受影响。
 
 用法示例：
+- 基础（单周期，同年区间；或强制关闭分段）
   python scripts/hierarchical_sweep_sharpe.py \
-    --qlib_dir "/home/ec2-user/.qlib/qlib_data/us_data" \
-    --preds "artifacts/preds/weekly/predictions.parquet" \
+    --qlib_dir "~/.qlib/qlib_data/us_data" \
+    --preds "artifacts/preds/preds_y5_2020_2024.parquet" \
     --features_path "artifacts/features_day.parquet" \
-    --start "2017-01-01" --end "2024-12-31" \
+    --start "2024-01-01" --end "2024-12-31" \
     --out_root "backtest/reports/hier_sweep" \
-    --stage1_preset coarse --run_stage2
+    --stage1_preset coarse --limit_stage1 10 \
+    --segmented off
 
-备注：默认策略 key 使用 config 中的 "sharpe_focus"；可根据需要调整。
+- 跨年（默认自动分段：2020-2024，每年现金承接，年初空仓；在合并的日收益上统一计算 KPI）
+  python scripts/hierarchical_sweep_sharpe.py \
+    --qlib_dir "~/.qlib/qlib_data/us_data" \
+    --preds "artifacts/preds/preds_y5_2020_2024.parquet" \
+    --features_path "artifacts/features_day.parquet" \
+    --start "2020-01-01" --end "2024-12-31" \
+    --out_root "backtest/reports/hier_sweep" \
+    --stage1_preset coarse --limit_stage1 20
+
+- 显式强制分段与自定义年份范围
+  python scripts/hierarchical_sweep_sharpe.py \
+    --qlib_dir "~/.qlib/qlib_data/us_data" \
+    --preds "artifacts/preds/preds_y5_2020_2024.parquet" \
+    --features_path "artifacts/features_day.parquet" \
+    --start "2019-01-01" --end "2025-12-31" \
+    --out_root "backtest/reports/hier_sweep" \
+    --stage1_preset coarse --limit_stage1 10 \
+    --segmented on --segmented_years 2020-2024 --segmented_init_cash 1000000
+
+- 启用第二阶段细化，并尝试不同权重方案/去因子项
+  python scripts/hierarchical_sweep_sharpe.py \
+    --qlib_dir "~/.qlib/qlib_data/us_data" \
+    --preds "artifacts/preds/preds_y5_2020_2024.parquet" \
+    --features_path "artifacts/features_day.parquet" \
+    --start "2020-01-01" --end "2024-12-31" \
+    --out_root "backtest/reports/hier_sweep" \
+    --stage1_preset coarse --run_stage2 \
+    --try_both_weight_schemes --try_alt_neutralize
+
+输出结构（单个参数组合目录内）：
+- 若单周期：直接包含 per_day_ext.csv、summary.json、kpis.json、orders/positions 等；
+- 若分段：包含 seg_YYYY 子目录；目录根写入合并后的 per_day_ext.csv、summary.json、kpis.json；
+  同时导出行业×流动性桶合并汇总（pnl_by_sector_liq_raw_long.csv / _raw_wide.csv）。
 """
 from __future__ import annotations
 import argparse
@@ -29,6 +65,8 @@ import sys
 import time
 import csv
 from typing import Dict, Any, List, Tuple
+import pandas as pd
+import numpy as np
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,14 +84,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--slippage_bps", type=float, default=5.0)
     ap.add_argument("--cash", type=float, default=1_000_000.0)
     ap.add_argument("--adv_limit_pct", type=float, default=0.0)
-    ap.add_argument("--dry", action="store_true", help="只打印命令，不执行")
+    ap.add_argument("--dry", action="store_true", help="仅打印命令，不执行")
     ap.add_argument("--limit_stage1", type=int, default=None, help="第1阶段最多运行多少组（抽样）")
     ap.add_argument("--limit_stage2", type=int, default=None, help="第2阶段最多运行多少组（抽样）")
 
     # 分阶段控制
     ap.add_argument("--stage1_preset", choices=["coarse", "medium", "fine", "focused"], default="coarse",
                     help="第1阶段粗粒度预设")
-    ap.add_argument("--run_stage2", action="store_true", help="启用第2阶段细化扫描")
+    ap.add_argument("--run_stage2", action="store_true", help="启用第2阶段细化扫掠")
 
     # 第2阶段邻域宽度（围绕最优点）
     ap.add_argument("--n_topk_neighbors", type=int, default=2, help="top_k 左右邻点数量（步长见下）")
@@ -70,6 +108,14 @@ def parse_args() -> argparse.Namespace:
     # 离散备选是否扩展
     ap.add_argument("--try_both_weight_schemes", action="store_true", help="第2阶段同时尝试 equal 与 icdf")
     ap.add_argument("--try_alt_neutralize", action="store_true", help="第2阶段同时尝试另一组去因子项")
+
+    # Segmented（多分段）支持
+    ap.add_argument("--segmented", choices=["auto", "on", "off"], default="auto",
+                    help="按年分段回测并在合并的日收益上计算KPI；auto(默认, 跨年则启用)/on/off")
+    ap.add_argument("--segmented_years", default=None,
+                    help="自定义年份范围，如 2020-2024；为空则依据 --start/--end 推断")
+    ap.add_argument("--segmented_init_cash", type=float, default=None,
+                    help="分段模式初始现金，默认取 --cash")
     return ap.parse_args()
 
 
@@ -80,7 +126,6 @@ def safe_tag(x) -> str:
 
 
 def build_grid_stage1(preset: str) -> List[Dict[str, Any]]:
-    """根据预设粒度构建第1阶段粗粒度网格。"""
     if preset == "coarse":
         top_k_list = [10, 30, 60]
         weight_schemes = ["icdf", "equal"]
@@ -129,7 +174,6 @@ def build_grid_stage1(preset: str) -> List[Dict[str, Any]]:
             "neutralize": neu,
             "target_vol": tv,
             "hard_cap": True,
-            # 长多设定
             "long_exposure": 1.0,
             "short_exposure": 0.0,
         })
@@ -150,7 +194,6 @@ def neighborhood(center: float, n: int, step: float, vmin: float = None, vmax: f
 
 
 def build_grid_stage2(best: Dict[str, Any], args: argparse.Namespace) -> List[Dict[str, Any]]:
-    """基于第1阶段最优参数，围绕其邻域构建细粒度网格。"""
     tk_center = int(best.get("top_k", 40))
     tv_center = float(best.get("target_vol", 0.10))
     buf_center = float(best.get("membership_buffer", 0.30))
@@ -211,40 +254,164 @@ def build_outdir(root: Path, stage: str, params: dict) -> Path:
 
 
 def run_one(args: argparse.Namespace, out_dir: Path, p: dict) -> int:
-    cmd = [
-        sys.executable, "backtest/engine/run_backtest.py",
-        "--config", args.config,
-        "--strategy_key", args.strategy_key,
-        "--qlib_dir", args.qlib_dir,
-        "--preds", args.preds,
-        "--features_path", args.features_path,
-        "--start", args.start,
-        "--end", args.end,
-        "--out_dir", str(out_dir),
-        "--trade_at", args.trade_at,
-        "--commission_bps", str(args.commission_bps),
-        "--slippage_bps", str(args.slippage_bps),
-        "--cash", str(args.cash),
-        "--adv_limit_pct", str(args.adv_limit_pct),
-        # 选股与入场（显式覆盖）
-        "--top_k", str(p["top_k"]),
-        "--short_k", str(p["short_k"]),
-        "--membership_buffer", str(p["membership_buffer"]),
-        "--weight_scheme", p["weight_scheme"],
-        "--max_pos_per_name", str(p["max_pos_per_name"]),
-        "--smooth_eta", str(p["smooth_eta"]),
-        "--neutralize", p["neutralize"],
-        "--target_vol", str(p["target_vol"]),
-        "--hard_cap",
-        "--long_exposure", str(p["long_exposure"]),
-        "--short_exposure", str(p["short_exposure"]),
-    ]
-    if args.dry:
-        print("DRY:", " ".join(cmd))
-        return 0
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    print(proc.stdout)
-    return proc.returncode
+    """单次运行：按配置选择单周期或分段模式（默认跨年自动启用分段）。"""
+    try:
+        start_yr = int(str(args.start)[:4])
+        end_yr = int(str(args.end)[:4])
+    except Exception:
+        start_yr = end_yr = 0
+    seg_mode = str(getattr(args, 'segmented', 'auto'))
+    use_segmented = (seg_mode == 'on') or (seg_mode == 'auto' and start_yr != end_yr)
+
+    def _base_cli_for(cash: float, seg_start: str, seg_end: str, seg_out: Path) -> list[str]:
+        return [
+            sys.executable, "backtest/engine/run_backtest.py",
+            "--config", args.config,
+            "--strategy_key", args.strategy_key,
+            "--qlib_dir", args.qlib_dir,
+            "--preds", args.preds,
+            "--features_path", args.features_path,
+            "--start", seg_start,
+            "--end", seg_end,
+            "--out_dir", str(seg_out),
+            "--trade_at", args.trade_at,
+            "--commission_bps", str(args.commission_bps),
+            "--slippage_bps", str(args.slippage_bps),
+            "--cash", str(float(cash)),
+            "--adv_limit_pct", str(args.adv_limit_pct),
+            "--top_k", str(p["top_k"]),
+            "--short_k", str(p["short_k"]),
+            "--membership_buffer", str(p["membership_buffer"]),
+            "--weight_scheme", p["weight_scheme"],
+            "--max_pos_per_name", str(p["max_pos_per_name"]),
+            "--smooth_eta", str(p["smooth_eta"]),
+            "--neutralize", p["neutralize"],
+            "--target_vol", str(p["target_vol"]),
+            "--hard_cap",
+            "--long_exposure", str(p["long_exposure"]),
+            "--short_exposure", str(p["short_exposure"]),
+        ]
+
+    if not use_segmented:
+        cmd = _base_cli_for(float(args.cash), args.start, args.end, out_dir)
+        if args.dry:
+            print("DRY:", " ".join(cmd))
+            return 0
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(proc.stdout)
+        return proc.returncode
+
+    # segmented path
+    if args.segmented_years:
+        try:
+            y0, y1 = [int(x) for x in str(args.segmented_years).split('-')]
+        except Exception:
+            y0, y1 = start_yr, end_yr
+    else:
+        y0, y1 = start_yr, end_yr
+    years = list(range(y0, y1 + 1))
+    init_cash = float(args.segmented_init_cash if args.segmented_init_cash is not None else args.cash)
+
+    per_list: List[pd.DataFrame] = []
+    seg_dirs: List[Path] = []
+    cash_cur = init_cash
+    for y in years:
+        seg_dir = out_dir / f"seg_{y}"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        seg_start, seg_end = f"{y}-01-01", f"{y}-12-31"
+        cmd = _base_cli_for(cash_cur, seg_start, seg_end, seg_dir)
+        print(f"[seg] {y} cash_init={cash_cur:,.2f} -> {seg_dir}")
+        if args.dry:
+            print("DRY:", " ".join(cmd))
+        else:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            print(proc.stdout)
+            # update cash
+            try:
+                summ = json.loads((seg_dir / 'summary.json').read_text(encoding='utf-8'))
+                cash_cur = float(summ.get('cash_end', cash_cur))
+            except Exception:
+                pass
+            # collect per_day
+            try:
+                df = pd.read_csv(seg_dir / 'per_day_ext.csv', parse_dates=['datetime'])
+                if not df.empty:
+                    per_list.append(df)
+            except Exception:
+                pass
+        seg_dirs.append(seg_dir)
+
+    if not per_list:
+        return 1
+
+    per = pd.concat(per_list, ignore_index=True).sort_values('datetime')
+    per = per.drop_duplicates('datetime', keep='last')
+    per.to_csv(out_dir / 'per_day_ext.csv', index=False)
+
+    # recompute KPIs on merged per_day
+    r = per.get('ret', pd.Series(dtype=float)).astype(float).fillna(0.0).to_numpy()
+    n = r.size
+    if n > 0:
+        mean = float(np.mean(r)); std = float(np.std(r, ddof=1)) if n > 1 else 0.0
+        sharpe = float(np.sqrt(252.0) * mean / std) if std > 0 else 0.0
+        eq = (1.0 + r).cumprod()
+        yrs = float(n / 252.0) if n > 0 else 0.0
+        cagr = float(eq[-1] ** (1.0 / yrs) - 1.0) if yrs > 0 else 0.0
+        peak = np.maximum.accumulate(eq)
+        dd = (eq / peak) - 1.0
+        mdd_pct = float(-np.min(dd) * 100.0) if dd.size else 0.0
+    else:
+        sharpe = cagr = mdd_pct = 0.0
+    turn_mean = float(per.get('turnover_post', pd.Series(dtype=float)).mean()) if 'turnover_post' in per else 0.0
+    turn_p90 = float(per.get('turnover_post', pd.Series(dtype=float)).quantile(0.9)) if 'turnover_post' in per else 0.0
+    adv_days = float((per.get('adv_clip_names', pd.Series(dtype=float)) > 0).mean()) if 'adv_clip_names' in per else 0.0
+    adv_ratio = float(per.get('adv_clip_ratio', pd.Series(dtype=float)).replace([np.inf, -np.inf], np.nan).fillna(0.0).mean()) if 'adv_clip_ratio' in per else 0.0
+    gl_avg = float(per.get('gross_long', pd.Series(dtype=float)).mean()) if 'gross_long' in per else 0.0
+    gs_avg = float(per.get('gross_short', pd.Series(dtype=float)).mean()) if 'gross_short' in per else 0.0
+    kpis = {
+        'sharpe': sharpe,
+        'cagr': cagr,
+        'mdd_pct': mdd_pct,
+        'turnover_mean': turn_mean,
+        'turnover_p90': turn_p90,
+        'adv_clip_days_frac': adv_days,
+        'adv_clip_ratio_avg': adv_ratio,
+        'gross_long_avg': gl_avg,
+        'gross_short_avg': gs_avg,
+    }
+    (out_dir / 'kpis.json').write_text(json.dumps(kpis, indent=2), encoding='utf-8')
+    summary = {
+        'mode': 'segmented',
+        'years': years,
+        'init_cash': float(init_cash),
+        'final_cash': float(cash_cur),
+        **kpis,
+    }
+    (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+
+    # aggregate sector×liq across segments if available
+    raw_list = []
+    for d in seg_dirs:
+        f = d / 'pnl_by_sector_liq_raw_long.csv'
+        if f.exists():
+            try:
+                df = pd.read_csv(f)
+                if {'sector','liq_bucket','value'} <= set(df.columns):
+                    raw_list.append(df[['sector','liq_bucket','value']])
+            except Exception:
+                pass
+    if raw_list:
+        agg = pd.concat(raw_list, ignore_index=True).groupby(['sector','liq_bucket'], as_index=False)['value'].sum()
+        agg.to_csv(out_dir / 'pnl_by_sector_liq_raw_long.csv', index=False)
+        wide = agg.pivot_table(index='sector', columns='liq_bucket', values='value', aggfunc='sum').fillna(0.0)
+        cols = list(wide.columns)
+        num_cols = [c for c in cols if isinstance(c, str) and c.startswith('liq_') and c.split('_')[-1].isdigit()]
+        num_cols_sorted = sorted(num_cols, key=lambda x: int(x.split('_')[-1]))
+        other_cols = [c for c in cols if c not in num_cols]
+        col_order = num_cols_sorted + [c for c in other_cols if c != 'liq_unknown'] + (['liq_unknown'] if 'liq_unknown' in other_cols else [])
+        wide = wide.reindex(columns=[c for c in col_order if c in wide.columns])
+        wide.to_csv(out_dir / 'pnl_by_sector_liq_raw_wide.csv', float_format='%.2f')
+    return 0
 
 
 def load_kpis(out_dir: Path) -> dict:

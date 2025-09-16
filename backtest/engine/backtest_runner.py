@@ -299,7 +299,7 @@ class BacktestRunner:
 
                     # 仅输出行业×流动性：长表与宽表 CSV
                     try:
-                        # joint matrix: 仅输出宽表 CSV（sectors 作为行，liq_buckets 作为列）
+                        # 1) 归一化矩阵（现有输出）：仅输出宽表 CSV（sectors 作为行，liq_buckets 作为列）
                         if joint_norm:
                             rows = []
                             for s, dct in joint_norm.items():
@@ -315,8 +315,30 @@ class BacktestRunner:
                                 col_order = num_cols_sorted + [c for c in other_cols if c != "liq_unknown"] + (["liq_unknown"] if "liq_unknown" in other_cols else [])
                                 df_wide = df_wide.reindex(columns=[c for c in col_order if c in df_wide.columns])
                                 df_wide.to_csv(out_dir / "pnl_by_sector_liq_wide.csv", float_format='%.2f')
-                    except Exception:
-                        pass
+
+                        # 2) 原始未归一化贡献（新增）：输出长表与宽表，便于多时间段/多 run 汇总
+                        if sector_liq_pnl:
+                            raw_rows = []
+                            for s, dct in sector_liq_pnl.items():
+                                for b, v in dct.items():
+                                    raw_rows.append((s, b, float(v)))
+                            df_raw_long = pd.DataFrame(raw_rows, columns=["sector", "liq_bucket", "value"])
+                            if not df_raw_long.empty:
+                                df_raw_long.to_csv(out_dir / "pnl_by_sector_liq_raw_long.csv", index=False)
+                                df_raw_wide = df_raw_long.pivot_table(index="sector", columns="liq_bucket", values="value", aggfunc="sum").fillna(0.0)
+                                # 列排序与归一化版本一致
+                                cols = list(df_raw_wide.columns)
+                                num_cols = [c for c in cols if isinstance(c, str) and c.startswith("liq_") and c.split("_")[-1].isdigit()]
+                                num_cols_sorted = sorted(num_cols, key=lambda x: int(x.split("_")[-1]))
+                                other_cols = [c for c in cols if c not in num_cols]
+                                col_order = num_cols_sorted + [c for c in other_cols if c != "liq_unknown"] + (["liq_unknown"] if "liq_unknown" in other_cols else [])
+                                df_raw_wide = df_raw_wide.reindex(columns=[c for c in col_order if c in df_raw_wide.columns])
+                                df_raw_wide.to_csv(out_dir / "pnl_by_sector_liq_raw_wide.csv", float_format='%.2f')
+                    except Exception as e:
+                        try:
+                            print(f"[warn] failed to output sector×liq CSV: {e}")
+                        except Exception:
+                            pass
         except Exception as e:
             # 不影响主流程
             try:
